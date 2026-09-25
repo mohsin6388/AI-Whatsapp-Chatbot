@@ -238,20 +238,14 @@ const logger = require("../utils/logger");
  */
 
 const verifyWebhook = asyncHandler(async (req, res) => {
-  // Supports both flat and nested query formats.
-  const getQueryValue = (flatKey, nestedKey) => {
-    const value = req.query[flatKey] ?? req.query.hub?.[nestedKey];
+  // Parse query parameters directly from the request URL.
+  // This avoids relying on Express's req.query parser.
+  const queryString = (req.originalUrl || req.url).split("?")[1] || "";
+  const params = new URLSearchParams(queryString);
 
-    const normalizedValue = Array.isArray(value) ? value[0] : value;
-
-    return typeof normalizedValue === "string"
-      ? normalizedValue.trim()
-      : normalizedValue;
-  };
-
-  const mode = getQueryValue("hub.mode", "mode");
-  const token = getQueryValue("hub.verify_token", "verify_token");
-  const challenge = getQueryValue("hub.challenge", "challenge");
+  const mode = params.get("hub.mode")?.trim();
+  const token = params.get("hub.verify_token")?.trim();
+  const challenge = params.get("hub.challenge")?.trim();
 
   const configuredToken = env.metaWhatsapp.verifyToken;
 
@@ -266,17 +260,18 @@ const verifyWebhook = asyncHandler(async (req, res) => {
     return res.status(200).type("text/plain").send(challenge);
   }
 
+  // Do not log the actual verify token.
   logger.warn("[whatsapp] Webhook verification failed", {
-    modeReceived: mode,
+    modeReceived: mode || null,
     tokenReceived: Boolean(token),
     tokenConfigured: Boolean(configuredToken),
     challengeReceived: Boolean(challenge),
-    queryKeys: Object.keys(req.query || {}),
-    hubKeys: Object.keys(req.query?.hub || {}),
+    requestUrlHasQuery: queryString.length > 0,
   });
 
   return res.sendStatus(403);
 });
+
 // const verifyWebhook = asyncHandler(async (req, res) => {
 //   // Express may return an array when query parameters are repeated.
 //   const getQueryValue = (value) => {
