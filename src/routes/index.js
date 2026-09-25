@@ -1,0 +1,18 @@
+const express = require('express');
+const router = express.Router();
+
+router.use('/auth', require('./authRoutes'));
+router.use('/leads', require('./leadRoutes'));
+router.use('/properties', require('./propertyRoutes'));
+router.use('/whatsapp', require('./whatsappRoutes'));
+router.use('/conversations', require('./conversationRoutes'));
+router.use('/meetings', require('./meetingRoutes'));
+router.use('/followups', require('./followupRoutes'));
+router.use('/settings', require('./settingsRoutes'));
+router.use('/analytics', require('./analyticsRoutes'));
+router.use('/notifications', require('./notificationRoutes'));
+router.use('/audit-logs', require('./auditLogRoutes'));
+
+router.get('/health', (req, res) => res.json({ success: true, message: 'API is healthy' }));
+
+module.exports = router;
