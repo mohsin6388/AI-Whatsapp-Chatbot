@@ -236,9 +236,12 @@ const logger = require("../utils/logger");
  *
  * If the token matches, echo hub.challenge back as plain text.
  */
+
 const verifyWebhook = asyncHandler(async (req, res) => {
-  // Express may return an array when query parameters are repeated.
-  const getQueryValue = (value) => {
+  // Supports both flat and nested query formats.
+  const getQueryValue = (flatKey, nestedKey) => {
+    const value = req.query[flatKey] ?? req.query.hub?.[nestedKey];
+
     const normalizedValue = Array.isArray(value) ? value[0] : value;
 
     return typeof normalizedValue === "string"
@@ -246,9 +249,9 @@ const verifyWebhook = asyncHandler(async (req, res) => {
       : normalizedValue;
   };
 
-  const mode = getQueryValue(req.query["hub.mode"]);
-  const token = getQueryValue(req.query["hub.verify_token"]);
-  const challenge = getQueryValue(req.query["hub.challenge"]);
+  const mode = getQueryValue("hub.mode", "mode");
+  const token = getQueryValue("hub.verify_token", "verify_token");
+  const challenge = getQueryValue("hub.challenge", "challenge");
 
   const configuredToken = env.metaWhatsapp.verifyToken;
 
@@ -259,22 +262,60 @@ const verifyWebhook = asyncHandler(async (req, res) => {
     challenge
   ) {
     logger.info("[whatsapp] Webhook verification succeeded");
+
     return res.status(200).type("text/plain").send(challenge);
   }
 
-  // Never log the actual verify token.
   logger.warn("[whatsapp] Webhook verification failed", {
     modeReceived: mode,
     tokenReceived: Boolean(token),
     tokenConfigured: Boolean(configuredToken),
     challengeReceived: Boolean(challenge),
-    tokenType: Array.isArray(req.query["hub.verify_token"])
-      ? "array"
-      : typeof req.query["hub.verify_token"],
+    queryKeys: Object.keys(req.query || {}),
+    hubKeys: Object.keys(req.query?.hub || {}),
   });
 
   return res.sendStatus(403);
 });
+// const verifyWebhook = asyncHandler(async (req, res) => {
+//   // Express may return an array when query parameters are repeated.
+//   const getQueryValue = (value) => {
+//     const normalizedValue = Array.isArray(value) ? value[0] : value;
+
+//     return typeof normalizedValue === "string"
+//       ? normalizedValue.trim()
+//       : normalizedValue;
+//   };
+
+//   const mode = getQueryValue(req.query["hub.mode"]);
+//   const token = getQueryValue(req.query["hub.verify_token"]);
+//   const challenge = getQueryValue(req.query["hub.challenge"]);
+
+//   const configuredToken = env.metaWhatsapp.verifyToken;
+
+//   if (
+//     mode === "subscribe" &&
+//     configuredToken &&
+//     token === configuredToken &&
+//     challenge
+//   ) {
+//     logger.info("[whatsapp] Webhook verification succeeded");
+//     return res.status(200).type("text/plain").send(challenge);
+//   }
+
+//   // Never log the actual verify token.
+//   logger.warn("[whatsapp] Webhook verification failed", {
+//     modeReceived: mode,
+//     tokenReceived: Boolean(token),
+//     tokenConfigured: Boolean(configuredToken),
+//     challengeReceived: Boolean(challenge),
+//     tokenType: Array.isArray(req.query["hub.verify_token"])
+//       ? "array"
+//       : typeof req.query["hub.verify_token"],
+//   });
+
+//   return res.sendStatus(403);
+// });
 
 /**
  * POST /api/whatsapp/webhook
