@@ -1,20 +1,27 @@
-const Lead = require('../../models/Lead');
-const Conversation = require('../../models/Conversation');
-const Message = require('../../models/Message');
-const Meeting = require('../../models/Meeting');
-const Notification = require('../../models/Notification');
+const Lead = require("../../models/Lead");
+const Conversation = require("../../models/Conversation");
+const Message = require("../../models/Message");
+const Meeting = require("../../models/Meeting");
+const Notification = require("../../models/Notification");
 
-const settingsService = require('../settings/settingsService');
-const metaWhatsappClient = require('../whatsapp/metaWhatsappClient');
-const { recordOutboundMessage } = require('../whatsapp/messageStore');
-const { matchProperties } = require('./propertyMatcher');
-const { generateStructured } = require('./geminiClient');
-const { buildSystemInstruction, REPLY_RESPONSE_SCHEMA, toGeminiHistory } = require('./promptBuilder');
-const { analyzeConversationAsync } = require('./leadAnalyzer');
-const { createCalendarEvent, updateCalendarEvent } = require('../calendar/googleCalendarService');
-const env = require('../../config/env');
-const { emitToUser } = require('../../sockets');
-const logger = require('../../utils/logger');
+const settingsService = require("../settings/settingsService");
+const metaWhatsappClient = require("../whatsapp/metaWhatsappClient");
+const { recordOutboundMessage } = require("../whatsapp/messageStore");
+const { matchProperties } = require("./propertyMatcher");
+const { generateStructured } = require("./geminiClient");
+const {
+  buildSystemInstruction,
+  REPLY_RESPONSE_SCHEMA,
+  toGeminiHistory,
+} = require("./promptBuilder");
+const { analyzeConversationAsync } = require("./leadAnalyzer");
+const {
+  createCalendarEvent,
+  updateCalendarEvent,
+} = require("../calendar/googleCalendarService");
+const env = require("../../config/env");
+const { emitToUser } = require("../../sockets");
+const logger = require("../../utils/logger");
 
 const HISTORY_LIMIT = 30; // most recent messages sent as context per turn — enough memory without blowing the token budget
 
@@ -32,7 +39,8 @@ const HISTORY_LIMIT = 30; // most recent messages sent as context per turn — e
  */
 async function handleInbound({ conversation, lead, message }) {
   // Manual takeover or globally paused AI — the broker is handling this chat themselves.
-  if (conversation.status === 'manual' || conversation.status === 'closed') return;
+  if (conversation.status === "manual" || conversation.status === "closed")
+    return;
 
   const settings = await settingsService.getOrCreateSettings();
   if (settings.aiPaused || !settings.autoReplyEnabled) return;
@@ -40,11 +48,15 @@ async function handleInbound({ conversation, lead, message }) {
 
   const apiKey = await settingsService.getGeminiKey();
   if (!apiKey) {
-    logger.warn(`[ai] No Gemini API key configured — skipping AI reply for lead ${lead._id}`);
+    logger.warn(
+      `[ai] No Gemini API key configured — skipping AI reply for lead ${lead._id}`,
+    );
     return;
   }
 
-  const recentMessages = await Message.find({ conversationId: conversation._id })
+  const recentMessages = await Message.find({
+    conversationId: conversation._id,
+  })
     .sort({ timestamp: -1 })
     .limit(HISTORY_LIMIT)
     .lean();
@@ -73,14 +85,13 @@ async function handleInbound({ conversation, lead, message }) {
     settings,
     collectedRequirements: requirements,
     matchedProperties: candidateProperties,
-    referralStatus: conversation.referralStatus || 'none',
-    referralPersonName: settings.referral?.personName || env.referral.personName,
+    referralStatus: conversation.referralStatus || "none",
+    referralPersonName:
+      settings.referral?.personName || env.referral.personName,
   });
 
   let result;
   try {
-
-
     result = await generateStructured({
       apiKey,
       systemInstruction,
@@ -88,14 +99,19 @@ async function handleInbound({ conversation, lead, message }) {
       responseSchema: REPLY_RESPONSE_SCHEMA,
     });
   } catch (err) {
-    logger.error(`[ai] Gemini reply generation failed for lead ${lead._id}`, { error: err.message });
+    logger.error(`[ai] Gemini reply generation failed for lead ${lead._id}`, {
+      error: err.message,
+    });
     return; // fail silently to the buyer — broker can still see & manually reply from the Conversations page
   }
 
   const { parsed, raw } = result;
 
   // Merge newly extracted requirements into what we already knew (never overwrite with blanks).
-  const mergedRequirements = mergeRequirements(requirements, parsed.extractedRequirements);
+  const mergedRequirements = mergeRequirements(
+    requirements,
+    parsed.extractedRequirements,
+  );
   conversation.collectedRequirements = mergedRequirements;
   conversation.lastIntent = parsed.intent;
   conversation.lastSentiment = parsed.sentiment;
@@ -112,32 +128,49 @@ async function handleInbound({ conversation, lead, message }) {
   // so it's always the real configured number and never something the LLM
   // could get wrong or hallucinate.
   let outboundText = parsed.reply;
-  const referralPersonName = settings.referral?.personName || env.referral.personName;
-  const referralContactNumber = settings.referral?.contactNumber || env.referral.contactNumber;
+  const referralPersonName =
+    settings.referral?.personName || env.referral.personName;
+  const referralContactNumber =
+    settings.referral?.contactNumber || env.referral.contactNumber;
   const referralEnabled = settings.referral?.enabled ?? env.referral.enabled;
 
-  if (referralEnabled && conversation.referralStatus === 'none' && parsed.referralStage === 'ask_now') {
-    conversation.referralStatus = 'asked';
+  if (
+    referralEnabled &&
+    conversation.referralStatus === "none" &&
+    parsed.referralStage === "ask_now"
+  ) {
+    conversation.referralStatus = "asked";
     conversation.referralAskedAt = new Date();
-  } else if (conversation.referralStatus === 'asked' && parsed.referralStage === 'accepted') {
-    conversation.referralStatus = 'accepted';
+  } else if (
+    conversation.referralStatus === "asked" &&
+    parsed.referralStage === "accepted"
+  ) {
+    conversation.referralStatus = "accepted";
     conversation.referralRespondedAt = new Date();
     if (referralContactNumber) {
       outboundText = `${parsed.reply}\n\n${referralPersonName} ka number: ${referralContactNumber}\nAap directly WhatsApp/call kar sakte hain 🙂`;
     } else {
-      logger.warn(`[ai] Referral accepted for lead ${lead._id} but no referral contact number is configured (set REFERRAL_CONTACT_NUMBER or Settings.referral.contactNumber)`);
+      logger.warn(
+        `[ai] Referral accepted for lead ${lead._id} but no referral contact number is configured (set REFERRAL_CONTACT_NUMBER or Settings.referral.contactNumber)`,
+      );
     }
-  } else if (conversation.referralStatus === 'asked' && parsed.referralStage === 'declined') {
-    conversation.referralStatus = 'declined';
+  } else if (
+    conversation.referralStatus === "asked" &&
+    parsed.referralStage === "declined"
+  ) {
+    conversation.referralStatus = "declined";
     conversation.referralRespondedAt = new Date();
   }
 
   // Mirror the key fields back onto Lead so existing list/filter/CSV export UI stays useful.
   const leadUpdates = {};
   if (mergedRequirements.city) leadUpdates.city = mergedRequirements.city;
-  if (mergedRequirements.location) leadUpdates.location = mergedRequirements.location;
-  if (mergedRequirements.budgetMin != null) leadUpdates.budgetMin = mergedRequirements.budgetMin;
-  if (mergedRequirements.budgetMax != null) leadUpdates.budgetMax = mergedRequirements.budgetMax;
+  if (mergedRequirements.location)
+    leadUpdates.location = mergedRequirements.location;
+  if (mergedRequirements.budgetMin != null)
+    leadUpdates.budgetMin = mergedRequirements.budgetMin;
+  if (mergedRequirements.budgetMax != null)
+    leadUpdates.budgetMax = mergedRequirements.budgetMax;
   if (Object.keys(leadUpdates).length) {
     await Lead.updateOne({ _id: lead._id }, { $set: leadUpdates });
   }
@@ -163,7 +196,7 @@ async function handleInbound({ conversation, lead, message }) {
       conversationId: conversation._id,
       leadId: lead._id,
       text: outboundText,
-      sender: 'ai',
+      sender: "ai",
       whatsappMessageId: messageId || null,
       aiPrompt: systemInstruction,
       aiResponseRaw: raw,
@@ -171,27 +204,36 @@ async function handleInbound({ conversation, lead, message }) {
       sentiment: parsed.sentiment,
     });
   } catch (err) {
-    logger.error(`[ai] Failed to send AI reply for lead ${lead._id} via Meta WhatsApp Cloud API`, { error: err.response?.data || err.message });
+    logger.error(
+      `[ai] Failed to send AI reply for lead ${lead._id} via Meta WhatsApp Cloud API`,
+      { error: err.response?.data || err.message },
+    );
     await Notification.create({
       userId: conversation.ownerId,
-      type: 'whatsapp_send_failed',
-      title: `Couldn't message ${lead.name || 'lead'} — WhatsApp send failed`,
+      type: "whatsapp_send_failed",
+      title: `Couldn't message ${lead.name || "lead"} — WhatsApp send failed`,
       body: `Sending via WhatsApp failed for ${lead.phone}: ${err.message}`,
       link: `/leads/${lead._id}`,
     });
-    emitToUser(conversation.ownerId, 'notification:new', { leadId: lead._id });
+    emitToUser(conversation.ownerId, "notification:new", { leadId: lead._id });
     return;
   }
 
   // Buyer just agreed to a site visit — create it automatically.
   if (parsed.wantsSiteVisit) {
-    await createSiteVisit({ lead, conversation, date: parsed.proposedDate, time: parsed.proposedTime, property: candidateProperties[0] });
+    await createSiteVisit({
+      lead,
+      conversation,
+      date: parsed.proposedDate,
+      time: parsed.proposedTime,
+      property: candidateProperties[0],
+    });
   }
 
   conversation.requirementsComplete = !!parsed.readyForPropertyRecommendation;
   await conversation.save();
 
-  emitToUser(conversation.ownerId, 'conversation:aiReply', {
+  emitToUser(conversation.ownerId, "conversation:aiReply", {
     conversationId: conversation._id,
     leadId: lead._id,
     message: outbound,
@@ -199,8 +241,13 @@ async function handleInbound({ conversation, lead, message }) {
 
   // Lead scoring + follow-up planning runs as a separate Gemini pass, fired
   // async so the buyer isn't kept waiting on a second model call.
-  analyzeConversationAsync({ leadId: lead._id, conversationId: conversation._id }).catch((err) =>
-    logger.error(`[ai] Async lead analysis failed for lead ${lead._id}`, { error: err.message })
+  analyzeConversationAsync({
+    leadId: lead._id,
+    conversationId: conversation._id,
+  }).catch((err) =>
+    logger.error(`[ai] Async lead analysis failed for lead ${lead._id}`, {
+      error: err.message,
+    }),
   );
 }
 
@@ -222,7 +269,7 @@ async function handleInbound({ conversation, lead, message }) {
  * conversation already has any messages, isn't AI-driven, or AI is paused.
  */
 async function startConversation({ lead, conversation }) {
-  if (conversation.status !== 'ai_active') return;
+  if (conversation.status !== "ai_active") return;
 
   // Do not depend on our webhook to know whether Meta's 24h window is open.
   // The same WhatsApp number may already have an active webhook in n8n, so
@@ -231,13 +278,13 @@ async function startConversation({ lead, conversation }) {
   // TRY plain text first. Meta is the source of truth for the 24h window.
   const alreadyStarted = await Message.exists({
     conversationId: conversation._id,
-    direction: 'outbound',
+    direction: "outbound",
   });
   if (alreadyStarted) return;
 
   if (!env.metaWhatsapp.accessToken || !env.metaWhatsapp.phoneNumberId) {
     logger.warn(
-      `[ai] Meta WhatsApp Cloud API is not configured (META_WHATSAPP_ACCESS_TOKEN/META_WHATSAPP_PHONE_NUMBER_ID) — skipping opening message for lead ${lead._id}`
+      `[ai] Meta WhatsApp Cloud API is not configured (META_WHATSAPP_ACCESS_TOKEN/META_WHATSAPP_PHONE_NUMBER_ID) — skipping opening message for lead ${lead._id}`,
     );
     return;
   }
@@ -256,12 +303,17 @@ async function startConversation({ lead, conversation }) {
   let usedTemplate = false;
 
   try {
-    // IMPORTANT FOR TESTING WITH AN EXISTING NUMBER:
-    // Try ordinary text first. If the recipient has messaged this business
-    // number within Meta's 24h customer-service window, this succeeds even
-    // when PropAI itself did not receive the inbound webhook (for example,
-    // because the webhook is currently handled by n8n).
-    try {
+    const lastInboundAt = conversation.lastInboundAt
+      ? new Date(conversation.lastInboundAt)
+      : null;
+
+    const isWindowOpen =
+      lastInboundAt &&
+      !Number.isNaN(lastInboundAt.getTime()) &&
+      Date.now() - lastInboundAt.getTime() < 24 * 60 * 60 * 1000;
+
+    if (isWindowOpen) {
+      // Customer ne last 24 hours mein message kiya hai: normal text allowed.
       const { messageId } = await metaWhatsappClient.sendTextMessage({
         phone: lead.phone,
         text: openingText,
@@ -271,40 +323,49 @@ async function startConversation({ lead, conversation }) {
         conversationId: conversation._id,
         leadId: lead._id,
         text: openingText,
-        sender: 'ai',
+        sender: "ai",
         whatsappMessageId: messageId || null,
       });
 
-      logger.info(`[ai] Opening text sent via Meta Cloud API for lead ${lead._id}`, {
-        phone: lead.phone,
-        reason: 'direct-text-first',
-      });
-    } catch (textErr) {
-      // 131047 is Meta's authoritative answer that the customer-service
-      // window is closed. Only then should we try an approved template.
-      if (textErr.code !== 'WHATSAPP_24H_WINDOW_CLOSED') throw textErr;
-
+      logger.info(
+        `[ai] Opening text sent via Meta Cloud API for lead ${lead._id}`,
+        {
+          phone: lead.phone,
+          reason: "24h-window-open",
+        },
+      );
+    } else {
+      // New lead / closed 24-hour window: approved template first.
+      // ENV value takes priority over an old template saved in Settings.
       const templateName =
-        settings.openingTemplate?.name || env.metaWhatsapp.openingTemplateName;
+        env.metaWhatsapp.openingTemplateName || settings.openingTemplate?.name;
+
+      const templateLanguage =
+        env.metaWhatsapp.openingTemplateLanguage ||
+        settings.openingTemplate?.language;
 
       if (!templateName) {
         throw new Error(
-          'WhatsApp rejected the normal text because the 24-hour window is closed, and no approved opening template is configured.'
+          "Opening template is not configured. Set META_WHATSAPP_OPENING_TEMPLATE_NAME.",
         );
       }
 
-      const templateLanguage =
-        settings.openingTemplate?.language || env.metaWhatsapp.openingTemplateLanguage;
+      const components = [];
 
-      const includeLeadName =
-        env.metaWhatsapp.openingTemplateIncludeLeadName && Boolean(lead.name);
+      // Use this only if the approved template has an IMAGE header.
+      const imageUrl = process.env.META_WHATSAPP_OPENING_TEMPLATE_IMAGE_URL;
 
-      const components = includeLeadName
-        ? [{
-            type: 'body',
-            parameters: [{ type: 'text', text: lead.name }],
-          }]
-        : [];
+      if (imageUrl) {
+        components.push({
+          type: "header",
+          parameters: [
+            {
+              type: "image",
+              image: { link: imageUrl },
+            },
+          ],
+        });
+      }
 
       const { messageId } = await metaWhatsappClient.sendTemplateMessage({
         phone: lead.phone,
@@ -317,42 +378,141 @@ async function startConversation({ lead, conversation }) {
         conversationId: conversation._id,
         leadId: lead._id,
         text: `[Template: ${templateName}]`,
-        sender: 'ai',
+        sender: "ai",
         whatsappMessageId: messageId || null,
       });
 
       usedTemplate = true;
+
       logger.info(`[ai] Opening WhatsApp template sent for lead ${lead._id}`, {
         templateName,
         templateLanguage,
-        reason: '24h-window-closed',
+        reason: "24h-window-closed",
       });
     }
   } catch (err) {
-    logger.error(`[ai] Failed to send opening WhatsApp message for lead ${lead._id}`, {
-      error: err.metaError || err.response?.data || err.message,
-      code: err.code,
-      phone: lead.phone,
-    });
+    logger.error(
+      `[ai] Failed to send opening WhatsApp message for lead ${lead._id}`,
+      {
+        error: err.metaError || err.response?.data || err.message,
+        code: err.code,
+        phone: lead.phone,
+      },
+    );
 
     await Notification.create({
       userId: conversation.ownerId,
-      type: 'whatsapp_send_failed',
-      title: `Couldn't message ${lead.name || 'lead'} — WhatsApp send failed`,
+      type: "whatsapp_send_failed",
+      title: `Couldn't message ${lead.name || "lead"} — WhatsApp send failed`,
       body: `Sending the opening WhatsApp message failed for ${lead.phone}: ${err.message}`,
       link: `/leads/${lead._id}`,
     });
 
-    emitToUser(conversation.ownerId, 'notification:new', { leadId: lead._id });
+    emitToUser(conversation.ownerId, "notification:new", { leadId: lead._id });
     return;
   }
+
+  // let outbound = null;
+  // let usedTemplate = false;
+
+  // try {
+  //   // IMPORTANT FOR TESTING WITH AN EXISTING NUMBER:
+  //   // Try ordinary text first. If the recipient has messaged this business
+  //   // number within Meta's 24h customer-service window, this succeeds even
+  //   // when PropAI itself did not receive the inbound webhook (for example,
+  //   // because the webhook is currently handled by n8n).
+  //   try {
+  //     const { messageId } = await metaWhatsappClient.sendTextMessage({
+  //       phone: lead.phone,
+  //       text: openingText,
+  //     });
+
+  //     outbound = await recordOutboundMessage({
+  //       conversationId: conversation._id,
+  //       leadId: lead._id,
+  //       text: openingText,
+  //       sender: 'ai',
+  //       whatsappMessageId: messageId || null,
+  //     });
+
+  //     logger.info(`[ai] Opening text sent via Meta Cloud API for lead ${lead._id}`, {
+  //       phone: lead.phone,
+  //       reason: 'direct-text-first',
+  //     });
+  //   } catch (textErr) {
+  //     // 131047 is Meta's authoritative answer that the customer-service
+  //     // window is closed. Only then should we try an approved template.
+  //     if (textErr.code !== 'WHATSAPP_24H_WINDOW_CLOSED') throw textErr;
+
+  //     const templateName =
+  //       settings.openingTemplate?.name || env.metaWhatsapp.openingTemplateName;
+
+  //     if (!templateName) {
+  //       throw new Error(
+  //         'WhatsApp rejected the normal text because the 24-hour window is closed, and no approved opening template is configured.'
+  //       );
+  //     }
+
+  //     const templateLanguage =
+  //       settings.openingTemplate?.language || env.metaWhatsapp.openingTemplateLanguage;
+
+  //     const includeLeadName =
+  //       env.metaWhatsapp.openingTemplateIncludeLeadName && Boolean(lead.name);
+
+  //     const components = includeLeadName
+  //       ? [{
+  //           type: 'body',
+  //           parameters: [{ type: 'text', text: lead.name }],
+  //         }]
+  //       : [];
+
+  //     const { messageId } = await metaWhatsappClient.sendTemplateMessage({
+  //       phone: lead.phone,
+  //       templateName,
+  //       languageCode: templateLanguage,
+  //       components,
+  //     });
+
+  //     outbound = await recordOutboundMessage({
+  //       conversationId: conversation._id,
+  //       leadId: lead._id,
+  //       text: `[Template: ${templateName}]`,
+  //       sender: 'ai',
+  //       whatsappMessageId: messageId || null,
+  //     });
+
+  //     usedTemplate = true;
+  //     logger.info(`[ai] Opening WhatsApp template sent for lead ${lead._id}`, {
+  //       templateName,
+  //       templateLanguage,
+  //       reason: '24h-window-closed',
+  //     });
+  //   }
+  // } catch (err) {
+  //   logger.error(`[ai] Failed to send opening WhatsApp message for lead ${lead._id}`, {
+  //     error: err.metaError || err.response?.data || err.message,
+  //     code: err.code,
+  //     phone: lead.phone,
+  //   });
+
+  //   await Notification.create({
+  //     userId: conversation.ownerId,
+  //     type: 'whatsapp_send_failed',
+  //     title: `Couldn't message ${lead.name || 'lead'} — WhatsApp send failed`,
+  //     body: `Sending the opening WhatsApp message failed for ${lead.phone}: ${err.message}`,
+  //     link: `/leads/${lead._id}`,
+  //   });
+
+  //   emitToUser(conversation.ownerId, 'notification:new', { leadId: lead._id });
+  //   return;
+  // }
 
   conversation.templateSent = usedTemplate;
   conversation.templateSentAt = usedTemplate ? new Date() : null;
   conversation.lastMessageAt = new Date();
   await conversation.save();
 
-  emitToUser(conversation.ownerId, 'conversation:aiReply', {
+  emitToUser(conversation.ownerId, "conversation:aiReply", {
     conversationId: conversation._id,
     leadId: lead._id,
     message: outbound,
@@ -368,7 +528,10 @@ async function startConversation({ lead, conversation }) {
  * from an admin action or a cron job) if you want a retry sweep.
  */
 async function catchUpPendingConversations(brokerId) {
-  const pending = await Conversation.find({ ownerId: brokerId, status: 'ai_active' }).lean();
+  const pending = await Conversation.find({
+    ownerId: brokerId,
+    status: "ai_active",
+  }).lean();
   if (!pending.length) return;
 
   const leadIds = pending.map((c) => c.leadId);
@@ -387,19 +550,23 @@ async function catchUpPendingConversations(brokerId) {
     const conversation = await Conversation.findById(convoLean._id);
     started += 1;
     startConversation({ lead, conversation }).catch((err) =>
-      logger.error(`[ai] Catch-up auto-start failed for lead ${lead._id}`, { error: err.message })
+      logger.error(`[ai] Catch-up auto-start failed for lead ${lead._id}`, {
+        error: err.message,
+      }),
     );
   }
 
   if (started) {
-    logger.info(`[ai] Broker ${brokerId} connected — auto-starting ${started} pending WhatsApp conversation(s)`);
+    logger.info(
+      `[ai] Broker ${brokerId} connected — auto-starting ${started} pending WhatsApp conversation(s)`,
+    );
   }
 }
 
 function mergeRequirements(existing, incoming = {}) {
   const merged = { ...existing };
   for (const [key, value] of Object.entries(incoming)) {
-    if (value === undefined || value === null || value === '') continue;
+    if (value === undefined || value === null || value === "") continue;
     if (Array.isArray(value) && value.length === 0) continue;
     merged[key] = value;
   }
@@ -415,12 +582,13 @@ function mergeRequirements(existing, incoming = {}) {
  * alone and a fresh one started, since that's a genuinely new visit.
  */
 async function createSiteVisit({ lead, conversation, date, time, property }) {
-  const preferredDate = date || new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10); // default: 2 days out if not specified yet
-  const preferredTime = time || '11:00';
+  const preferredDate =
+    date || new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10); // default: 2 days out if not specified yet
+  const preferredTime = time || "11:00";
 
   let meeting = await Meeting.findOne({
     leadId: lead._id,
-    status: { $in: ['scheduled', 'rescheduled'] },
+    status: { $in: ["scheduled", "rescheduled"] },
   }).sort({ createdAt: -1 });
 
   let isNew = false;
@@ -428,7 +596,7 @@ async function createSiteVisit({ lead, conversation, date, time, property }) {
     meeting.preferredDate = preferredDate;
     meeting.preferredTime = preferredTime;
     if (property?._id) meeting.propertyId = property._id;
-    meeting.status = 'scheduled';
+    meeting.status = "scheduled";
     await meeting.save();
   } else {
     isNew = true;
@@ -438,35 +606,41 @@ async function createSiteVisit({ lead, conversation, date, time, property }) {
       propertyId: property?._id || null,
       preferredDate,
       preferredTime,
-      status: 'scheduled',
+      status: "scheduled",
     });
   }
 
   // Cached copy on Conversation for quick UI reads — Meeting model remains
   // the source of truth. Keep this in sync any time Meeting.status changes
   // elsewhere too (e.g. a broker marking a visit as done/cancelled).
-  conversation.meetingStatus = 'scheduled';
-  await Lead.updateOne({ _id: lead._id }, { $set: { status: 'site_visit' } });
+  conversation.meetingStatus = "scheduled";
+  await Lead.updateOne({ _id: lead._id }, { $set: { status: "site_visit" } });
 
   // Book/update the real calendar event. Best-effort: a Calendar failure
   // must never block the WhatsApp conversation or lose the Meeting record.
   try {
     if (meeting.googleEventId) {
-      const event = await updateCalendarEvent({ eventId: meeting.googleEventId, date: preferredDate, time: preferredTime });
+      const event = await updateCalendarEvent({
+        eventId: meeting.googleEventId,
+        date: preferredDate,
+        time: preferredTime,
+      });
       if (event) {
         meeting.googleEventLink = event.eventLink;
         await meeting.save();
       }
     } else {
       const event = await createCalendarEvent({
-        summary: `Site Visit — ${lead.name || lead.phone}${property ? ` (${property.projectName})` : ''}`,
+        summary: `Site Visit — ${lead.name || lead.phone}${property ? ` (${property.projectName})` : ""}`,
         description: [
-          `Lead: ${lead.name || 'N/A'} (${lead.phone})`,
-          property ? `Property: ${property.projectName}, ${property.city || ''}` : null,
-          'Booked automatically by the AI WhatsApp assistant.',
+          `Lead: ${lead.name || "N/A"} (${lead.phone})`,
+          property
+            ? `Property: ${property.projectName}, ${property.city || ""}`
+            : null,
+          "Booked automatically by the AI WhatsApp assistant.",
         ]
           .filter(Boolean)
-          .join('\n'),
+          .join("\n"),
         date: preferredDate,
         time: preferredTime,
       });
@@ -477,22 +651,30 @@ async function createSiteVisit({ lead, conversation, date, time, property }) {
       }
     }
   } catch (err) {
-    logger.error(`[calendar] Failed to sync Google Calendar event for lead ${lead._id}`, { error: err.message });
+    logger.error(
+      `[calendar] Failed to sync Google Calendar event for lead ${lead._id}`,
+      { error: err.message },
+    );
   }
 
   if (isNew) {
     await Notification.create({
       userId: conversation.ownerId,
-      type: 'site_visit_scheduled',
+      type: "site_visit_scheduled",
       title: `Site visit scheduled — ${lead.name}`,
-      body: `${preferredDate} at ${preferredTime}${property ? ` for ${property.projectName}` : ''}`,
+      body: `${preferredDate} at ${preferredTime}${property ? ` for ${property.projectName}` : ""}`,
       link: `/leads/${lead._id}`,
     });
   }
 
-  emitToUser(conversation.ownerId, 'meeting:created', { meeting });
+  emitToUser(conversation.ownerId, "meeting:created", { meeting });
 
   return meeting;
 }
 
-module.exports = { handleInbound, createSiteVisit, startConversation, catchUpPendingConversations };
+module.exports = {
+  handleInbound,
+  createSiteVisit,
+  startConversation,
+  catchUpPendingConversations,
+};
