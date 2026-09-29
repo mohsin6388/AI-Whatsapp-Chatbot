@@ -1,14 +1,13 @@
-const { Parser: CsvParser } = require('json2csv');
-const asyncHandler = require('../utils/asyncHandler');
-const ApiError = require('../utils/ApiError');
-const ApiResponse = require('../utils/ApiResponse');
-const Lead = require('../models/Lead');
-const Conversation = require('../models/Conversation');
-const AuditLog = require('../models/AuditLog');
-const { parseCsvBuffer, analyzeRows } = require('../services/csv/leadImporter');
-const conversationEngine = require('../services/ai/conversationEngine');
-const logger = require('../utils/logger');
-const { toWhatsAppNumber } = require('../services/whatsapp/metaWhatsappClient');
+const { Parser: CsvParser } = require("json2csv");
+const asyncHandler = require("../utils/asyncHandler");
+const ApiError = require("../utils/ApiError");
+const ApiResponse = require("../utils/ApiResponse");
+const Lead = require("../models/Lead");
+const Conversation = require("../models/Conversation");
+const AuditLog = require("../models/AuditLog");
+const { parseCsvBuffer, analyzeRows } = require("../services/csv/leadImporter");
+const { toWhatsAppNumber } = require("../services/whatsapp/metaWhatsappClient");
+const { enqueueLeads } = require("../services/queue/outboundQueue");
 
 /**
  * Scoping helper: brokers only ever see/act on their own leads.
@@ -17,7 +16,7 @@ const { toWhatsAppNumber } = require('../services/whatsapp/metaWhatsappClient');
  * not this resource) — enforced in the route via roleGuard.
  */
 function scopeToOwner(req) {
-  if (req.user.role === 'admin' && req.query.ownerId) {
+  if (req.user.role === "admin" && req.query.ownerId) {
     return { ownerId: req.query.ownerId };
   }
   return { ownerId: req.user.id };
@@ -29,7 +28,8 @@ function scopeToOwner(req) {
  * Nothing is written to the DB at this step.
  */
 const previewImport = asyncHandler(async (req, res) => {
-  if (!req.file) throw ApiError.badRequest('CSV file is required (field name: "file")');
+  if (!req.file)
+    throw ApiError.badRequest('CSV file is required (field name: "file")');
 
   let rows;
   try {
@@ -40,7 +40,9 @@ const previewImport = asyncHandler(async (req, res) => {
 
   const { rows: analyzed, summary } = await analyzeRows(req.user.id, rows);
 
-  return new ApiResponse(200, { rows: analyzed, summary }, 'CSV parsed').send(res);
+  return new ApiResponse(200, { rows: analyzed, summary }, "CSV parsed").send(
+    res,
+  );
 });
 
 /**
@@ -64,7 +66,7 @@ const confirmImport = asyncHandler(async (req, res) => {
     budgetMax: r.budgetMax ?? null,
     occupation: r.occupation || undefined,
     age: r.age ?? null,
-    source: r.source || 'csv_import',
+    source: r.source || "csv_import",
     notes: r.notes || undefined,
     requirements: r.requirements || undefined,
   }));
@@ -92,7 +94,7 @@ const confirmImport = asyncHandler(async (req, res) => {
     try {
       conversations = await Conversation.insertMany(
         inserted.map((lead) => ({ leadId: lead._id, ownerId: lead.ownerId })),
-        { ordered: false }
+        { ordered: false },
       );
     } catch (err) {
       // A conversation may already exist if this lead was re-imported — with
@@ -104,8 +106,8 @@ const confirmImport = asyncHandler(async (req, res) => {
 
   await AuditLog.create({
     userId: req.user.id,
-    action: 'lead.import',
-    entityType: 'Lead',
+    action: "lead.import",
+    entityType: "Lead",
     meta: { insertedCount: inserted.length, skipped },
     ip: req.ip,
   });
@@ -114,34 +116,74 @@ const confirmImport = asyncHandler(async (req, res) => {
   // approved Meta opening TEMPLATE (not free-text) and records the outbound
   // message only after Meta accepts it. We deliberately run this in the
   // background so a CSV import does not wait on Meta's network response.
+  // if (inserted.length) {
+  //   const conversationByLead = new Map(
+  //     conversations.map((c) => [c.leadId.toString(), c])
+  //   );
+
+  //   (async () => {
+  //     for (const lead of inserted) {
+  //       const conversation = conversationByLead.get(lead._id.toString());
+  //       if (!conversation) continue;
+  //       try {
+  //         await conversationEngine.startConversation({ lead, conversation });
+  //       } catch (err) {
+  //         logger.error(`[leads] Auto-start failed for imported lead ${lead._id}`, {
+  //           error: err.metaError || err.response?.data || err.message,
+  //           code: err.code,
+  //         });
+  //       }
+  //     }
+  //   })().catch((err) => {
+  //     logger.error('[leads] Imported-lead WhatsApp auto-start worker failed', { error: err.message });
+  //   });
+  // }
+
+  // Queue every newly imported lead that has a conversation.
+  let queueResult = {
+    batchId: null,
+    queued: 0,
+    skipped: 0,
+  };
+
   if (inserted.length) {
-    const conversationByLead = new Map(
-      conversations.map((c) => [c.leadId.toString(), c])
+    const conversationsForLeads = await Conversation.find({
+      ownerId,
+      leadId: { $in: inserted.map((lead) => lead._id) },
+    })
+      .select("leadId")
+      .lean();
+
+    const leadIdsWithConversation = conversationsForLeads.map(
+      (conversation) => conversation.leadId,
     );
 
-    (async () => {
-      for (const lead of inserted) {
-        const conversation = conversationByLead.get(lead._id.toString());
-        if (!conversation) continue;
-        try {
-          await conversationEngine.startConversation({ lead, conversation });
-        } catch (err) {
-          logger.error(`[leads] Auto-start failed for imported lead ${lead._id}`, {
-            error: err.metaError || err.response?.data || err.message,
-            code: err.code,
-          });
-        }
-      }
-    })().catch((err) => {
-      logger.error('[leads] Imported-lead WhatsApp auto-start worker failed', { error: err.message });
+    queueResult = await enqueueLeads({
+      ownerId,
+      leadIds: leadIdsWithConversation,
     });
   }
 
   return new ApiResponse(
     201,
-    { insertedCount: inserted.length, skipped, leadIds: inserted.map((l) => l._id), autoStartQueued: inserted.length },
-    `Imported ${inserted.length} leads${skipped ? `, skipped ${skipped} duplicates` : ''}. WhatsApp opening messages queued automatically.`
+    {
+      insertedCount: inserted.length,
+      skipped,
+      leadIds: inserted.map((lead) => lead._id),
+      autoStartQueued: queueResult.queued,
+      batchId: queueResult.batchId,
+      queueSkipped: queueResult.skipped,
+    },
+    `Imported ${inserted.length} leads. ${queueResult.queued} lead(s) queued for WhatsApp messaging${
+      skipped ? `, skipped ${skipped} duplicates` : ""
+    }.`,
   ).send(res);
+
+  // return new ApiResponse(
+  //   201,
+  //   { insertedCount: inserted.length, skipped, leadIds: inserted.map((l) => l._id), autoStartQueued: inserted.length },
+  //   `Imported ${inserted.length} leads${skipped ? `, skipped ${skipped} duplicates` : ''}. WhatsApp opening messages queued automatically.`
+  // ).send(res);
 });
 
 /**
@@ -153,28 +195,78 @@ const confirmImport = asyncHandler(async (req, res) => {
  * Safe to call more than once: startConversation() no-ops for leads that
  * already have messages.
  */
+
 const startConversations = asyncHandler(async (req, res) => {
   const { leadIds } = req.body;
-  if (!Array.isArray(leadIds) || !leadIds.length) throw ApiError.badRequest('leadIds is required');
 
-  const ownerId = req.user.id;
-  const leads = await Lead.find({ _id: { $in: leadIds }, ownerId });
-  const leadById = new Map(leads.map((l) => [l._id.toString(), l]));
-
-  const conversations = await Conversation.find({ leadId: { $in: leads.map((l) => l._id) } });
-
-  let started = 0;
-  for (const conversation of conversations) {
-    const lead = leadById.get(conversation.leadId.toString());
-    if (!lead) continue;
-    started += 1;
-    conversationEngine.startConversation({ lead, conversation }).catch((err) =>
-      logger.error(`[leads] Failed to start WhatsApp conversation for lead ${lead._id}`, { error: err.message })
-    );
+  if (!Array.isArray(leadIds) || !leadIds.length) {
+    throw ApiError.badRequest("leadIds is required");
   }
 
-  return new ApiResponse(200, { queued: started }, `Starting conversations for ${started} lead(s)`).send(res);
+  const ownerId = req.user.id;
+
+  // Only allow leads belonging to the logged-in broker.
+  const leads = await Lead.find({
+    _id: { $in: leadIds },
+    ownerId,
+  }).select("_id");
+
+  if (!leads.length) {
+    throw ApiError.badRequest("No valid leads found");
+  }
+
+  const validLeadIds = leads.map((lead) => lead._id);
+
+  // Only queue leads that have a conversation.
+  const conversations = await Conversation.find({
+    ownerId,
+    leadId: { $in: validLeadIds },
+  })
+    .select("leadId")
+    .lean();
+
+  const leadIdsWithConversation = conversations.map(
+    (conversation) => conversation.leadId,
+  );
+
+  const queueResult = await enqueueLeads({
+    ownerId,
+    leadIds: leadIdsWithConversation,
+  });
+
+  return new ApiResponse(
+    200,
+    {
+      queued: queueResult.queued,
+      skipped: queueResult.skipped,
+      batchId: queueResult.batchId,
+    },
+    `Queued ${queueResult.queued} lead(s) for WhatsApp messaging`,
+  ).send(res);
 });
+
+// const startConversations = asyncHandler(async (req, res) => {
+//   const { leadIds } = req.body;
+//   if (!Array.isArray(leadIds) || !leadIds.length) throw ApiError.badRequest('leadIds is required');
+
+//   const ownerId = req.user.id;
+//   const leads = await Lead.find({ _id: { $in: leadIds }, ownerId });
+//   const leadById = new Map(leads.map((l) => [l._id.toString(), l]));
+
+//   const conversations = await Conversation.find({ leadId: { $in: leads.map((l) => l._id) } });
+
+//   let started = 0;
+//   for (const conversation of conversations) {
+//     const lead = leadById.get(conversation.leadId.toString());
+//     if (!lead) continue;
+//     started += 1;
+//     conversationEngine.startConversation({ lead, conversation }).catch((err) =>
+//       logger.error(`[leads] Failed to start WhatsApp conversation for lead ${lead._id}`, { error: err.message })
+//     );
+//   }
+
+//   return new ApiResponse(200, { queued: started }, `Starting conversations for ${started} lead(s)`).send(res);
+// });
 
 /**
  * POST /api/leads
@@ -185,11 +277,12 @@ const createLead = asyncHandler(async (req, res) => {
   try {
     phone = toWhatsAppNumber(req.body.phone);
   } catch (err) {
-    throw ApiError.badRequest(err.message || 'Valid phone number is required');
+    throw ApiError.badRequest(err.message || "Valid phone number is required");
   }
 
   const existing = await Lead.findOne({ ownerId: req.user.id, phone });
-  if (existing) throw ApiError.conflict('A lead with this phone number already exists');
+  if (existing)
+    throw ApiError.conflict("A lead with this phone number already exists");
 
   const lead = await Lead.create({
     ...req.body,
@@ -197,29 +290,52 @@ const createLead = asyncHandler(async (req, res) => {
     ownerId: req.user.id,
   });
 
-  const conversation = await Conversation.create({ leadId: lead._id, ownerId: lead.ownerId });
+  const conversation = await Conversation.create({
+    leadId: lead._id,
+    ownerId: lead.ownerId,
+  });
 
-  conversationEngine.startConversation({ lead, conversation }).catch((err) =>
-    logger.error(`[leads] Failed to auto-start WhatsApp conversation for lead ${lead._id}`, { error: err.message })
-  );
+  const queueResult = await enqueueLeads({
+    ownerId: lead.ownerId,
+    leadIds: [lead._id],
+  });
 
-  return new ApiResponse(201, { lead }, 'Lead created').send(res);
+  // conversationEngine
+  //   .startConversation({ lead, conversation })
+  //   .catch((err) =>
+  //     logger.error(
+  //       `[leads] Failed to auto-start WhatsApp conversation for lead ${lead._id}`,
+  //       { error: err.message },
+  //     ),
+  //   );
+
+  return new ApiResponse(
+    201,
+    {
+      lead,
+      queued: queueResult.queued,
+      batchId: queueResult.batchId,
+    },
+    "Lead created and queued for WhatsApp messaging",
+  ).send(res);
+
+  // return new ApiResponse(201, { lead }, "Lead created").send(res);
 });
-
 
 /**
  * GET /api/leads
  */
 const listLeads = asyncHandler(async (req, res) => {
-  const { page, limit, search, status, city, tag, sortBy, sortOrder } = req.query;
+  const { page, limit, search, status, city, tag, sortBy, sortOrder } =
+    req.query;
 
   const filter = { ...scopeToOwner(req) };
   if (status) filter.status = status;
-  if (city) filter.city = new RegExp(`^${city}$`, 'i');
+  if (city) filter.city = new RegExp(`^${city}$`, "i");
   if (tag) filter.tags = tag;
   if (search) filter.$text = { $search: search };
 
-  const sort = { [sortBy]: sortOrder === 'asc' ? 1 : -1 };
+  const sort = { [sortBy]: sortOrder === "asc" ? 1 : -1 };
 
   const [leads, total] = await Promise.all([
     Lead.find(filter)
@@ -235,9 +351,11 @@ const listLeads = asyncHandler(async (req, res) => {
   // gone out yet (see POST /leads/start-conversations).
   const conversations = await Conversation.find(
     { leadId: { $in: leads.map((l) => l._id) } },
-    'leadId lastMessageAt'
+    "leadId lastMessageAt",
   ).lean();
-  const lastMessageByLead = new Map(conversations.map((c) => [c.leadId.toString(), c.lastMessageAt]));
+  const lastMessageByLead = new Map(
+    conversations.map((c) => [c.leadId.toString(), c.lastMessageAt]),
+  );
   const leadsWithStatus = leads.map((l) => ({
     ...l,
     conversationStarted: Boolean(lastMessageByLead.get(l._id.toString())),
@@ -254,7 +372,7 @@ const listLeads = asyncHandler(async (req, res) => {
  */
 const getLead = asyncHandler(async (req, res) => {
   const lead = await Lead.findOne({ _id: req.params.id, ...scopeToOwner(req) });
-  if (!lead) throw ApiError.notFound('Lead not found');
+  if (!lead) throw ApiError.notFound("Lead not found");
   return new ApiResponse(200, { lead }).send(res);
 });
 
@@ -268,29 +386,33 @@ const updateLead = asyncHandler(async (req, res) => {
       phone: req.body.phone,
       _id: { $ne: req.params.id },
     });
-    if (dupe) throw ApiError.conflict('Another lead already uses this phone number');
+    if (dupe)
+      throw ApiError.conflict("Another lead already uses this phone number");
   }
 
   const lead = await Lead.findOneAndUpdate(
     { _id: req.params.id, ...scopeToOwner(req) },
     { $set: req.body },
-    { new: true, runValidators: true }
+    { new: true, runValidators: true },
   );
-  if (!lead) throw ApiError.notFound('Lead not found');
+  if (!lead) throw ApiError.notFound("Lead not found");
 
-  return new ApiResponse(200, { lead }, 'Lead updated').send(res);
+  return new ApiResponse(200, { lead }, "Lead updated").send(res);
 });
 
 /**
  * DELETE /api/leads/:id
  */
 const deleteLead = asyncHandler(async (req, res) => {
-  const lead = await Lead.findOneAndDelete({ _id: req.params.id, ...scopeToOwner(req) });
-  if (!lead) throw ApiError.notFound('Lead not found');
+  const lead = await Lead.findOneAndDelete({
+    _id: req.params.id,
+    ...scopeToOwner(req),
+  });
+  if (!lead) throw ApiError.notFound("Lead not found");
 
   await Conversation.deleteOne({ leadId: lead._id });
 
-  return new ApiResponse(200, null, 'Lead deleted').send(res);
+  return new ApiResponse(200, null, "Lead deleted").send(res);
 });
 
 /**
@@ -303,7 +425,11 @@ const bulkDeleteLeads = asyncHandler(async (req, res) => {
   const result = await Lead.deleteMany(filter);
   await Conversation.deleteMany({ leadId: { $in: ids } });
 
-  return new ApiResponse(200, { deletedCount: result.deletedCount }, 'Leads deleted').send(res);
+  return new ApiResponse(
+    200,
+    { deletedCount: result.deletedCount },
+    "Leads deleted",
+  ).send(res);
 });
 
 /**
@@ -311,7 +437,7 @@ const bulkDeleteLeads = asyncHandler(async (req, res) => {
  */
 const updateTags = asyncHandler(async (req, res) => {
   const lead = await Lead.findOne({ _id: req.params.id, ...scopeToOwner(req) });
-  if (!lead) throw ApiError.notFound('Lead not found');
+  if (!lead) throw ApiError.notFound("Lead not found");
 
   const { add = [], remove = [] } = req.body;
   let tags = new Set(lead.tags);
@@ -320,7 +446,7 @@ const updateTags = asyncHandler(async (req, res) => {
   lead.tags = Array.from(tags);
   await lead.save();
 
-  return new ApiResponse(200, { lead }, 'Tags updated').send(res);
+  return new ApiResponse(200, { lead }, "Tags updated").send(res);
 });
 
 /**
@@ -331,22 +457,40 @@ const exportLeads = asyncHandler(async (req, res) => {
   const { search, status, city, tag } = req.query;
   const filter = { ...scopeToOwner(req) };
   if (status) filter.status = status;
-  if (city) filter.city = new RegExp(`^${city}$`, 'i');
+  if (city) filter.city = new RegExp(`^${city}$`, "i");
   if (tag) filter.tags = tag;
   if (search) filter.$text = { $search: search };
 
   const leads = await Lead.find(filter).sort({ createdAt: -1 }).lean();
 
   const fields = [
-    'name', 'phone', 'email', 'city', 'location', 'budgetMin', 'budgetMax',
-    'occupation', 'age', 'source', 'status', 'leadScore', 'tags', 'notes',
-    'requirements', 'createdAt',
+    "name",
+    "phone",
+    "email",
+    "city",
+    "location",
+    "budgetMin",
+    "budgetMax",
+    "occupation",
+    "age",
+    "source",
+    "status",
+    "leadScore",
+    "tags",
+    "notes",
+    "requirements",
+    "createdAt",
   ];
   const parser = new CsvParser({ fields });
-  const csv = parser.parse(leads.map((l) => ({ ...l, tags: (l.tags || []).join('|') })));
+  const csv = parser.parse(
+    leads.map((l) => ({ ...l, tags: (l.tags || []).join("|") })),
+  );
 
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', `attachment; filename="leads-export-${Date.now()}.csv"`);
+  res.setHeader("Content-Type", "text/csv");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="leads-export-${Date.now()}.csv"`,
+  );
   return res.send(csv);
 });
 
