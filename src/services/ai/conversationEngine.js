@@ -25,28 +25,24 @@ const env = require("../../config/env");
 const { emitToUser } = require("../../sockets");
 const logger = require("../../utils/logger");
 
-const HISTORY_LIMIT = 30; // most recent messages sent as context per turn — enough memory without blowing the token budget
+const HISTORY_LIMIT = 12; // most recent messages sent as context per turn — enough memory without blowing the token budget
 
 async function handleInbound({ conversation, lead, message }) {
-  const totalStart = Date.now();
-
+  // Manual takeover or globally paused AI — the broker is handling this chat themselves.
   if (conversation.status === "manual" || conversation.status === "closed")
     return;
 
-  const t1 = Date.now();
   const settings = await settingsService.getOrCreateSettings();
-  logger.info(`[LATENCY] settings: ${Date.now() - t1}ms`);
-
   if (settings.aiPaused || !settings.autoReplyEnabled) return;
-  if (settings.whatsappDisconnected) return;
+  if (settings.whatsappDisconnected) return; // broker hit "Disconnect" on the Settings page
 
-  const t2 = Date.now();
   const apiKey = await settingsService.getGeminiKey();
-  logger.info(`[LATENCY] gemini-key: ${Date.now() - t2}ms`);
-
-  if (!apiKey) return;
-
-  const t3 = Date.now();
+  if (!apiKey) {
+    logger.warn(
+      `[ai] No Gemini API key configured — skipping AI reply for lead ${lead._id}`,
+    );
+    return;
+  }
 
   const recentMessages = await Message.find({
     conversationId: conversation._id,
@@ -54,15 +50,17 @@ async function handleInbound({ conversation, lead, message }) {
     .sort({ timestamp: -1 })
     .limit(HISTORY_LIMIT)
     .lean();
+  recentMessages.reverse(); // oldest -> newest for the model
 
-  recentMessages.reverse();
-
-  logger.info(`[LATENCY] history: ${Date.now() - t3}ms`);
+  // Pull in any properties that already look like a fit given what we know
+  // so far, so the model can reference them by name instead of inventing details.
 
   const requirements = conversation.collectedRequirements || {};
 
-  const t4 = Date.now();
-
+  // Single-tenant deployment — matchProperties() searches the whole (one)
+  // inventory, so no org filter is needed here anymore. matchProperties()
+  // handles both "no city yet" (returns active inventory) and "city typed
+  // slightly differently" (soft match + fallback) internally.
   const candidateProperties = await matchProperties({
     city: requirements.city || lead.city,
     location: requirements.location || lead.location,
@@ -71,8 +69,6 @@ async function handleInbound({ conversation, lead, message }) {
     bhk: requirements.bhk,
     amenities: requirements.amenities,
   });
-
-  logger.info(`[LATENCY] property-matching: ${Date.now() - t4}ms`);
 
   const systemInstruction = buildSystemInstruction({
     lead,
@@ -84,10 +80,7 @@ async function handleInbound({ conversation, lead, message }) {
       settings.referral?.personName || env.referral.personName,
   });
 
-  const t5 = Date.now();
-
   let result;
-
   try {
     result = await generateStructured({
       apiKey,
@@ -96,250 +89,157 @@ async function handleInbound({ conversation, lead, message }) {
       responseSchema: REPLY_RESPONSE_SCHEMA,
     });
   } catch (err) {
-    logger.error("[LATENCY] Gemini failed", {
+    logger.error(`[ai] Gemini reply generation failed for lead ${lead._id}`, {
       error: err.message,
-      duration: `${Date.now() - t5}ms`,
     });
-    return;
+    return; // fail silently to the buyer — broker can still see & manually reply from the Conversations page
   }
 
-  logger.info(`[LATENCY] Gemini: ${Date.now() - t5}ms`);
+  const { parsed, raw } = result;
 
-  // ... existing code ...
+  // Merge newly extracted requirements into what we already knew (never overwrite with blanks).
+  const mergedRequirements = mergeRequirements(
+    requirements,
+    parsed.extractedRequirements,
+  );
+  conversation.collectedRequirements = mergedRequirements;
+  conversation.lastIntent = parsed.intent;
+  conversation.lastSentiment = parsed.sentiment;
+  if (candidateProperties.length) {
+    // Overwrite, not append — recommendedProperties always reflects the
+    // CURRENT recommendation set, not a running history of everything ever
+    // suggested. See Conversation model notes.
+    conversation.recommendedProperties = candidateProperties.map((p) => p._id);
+  }
 
-  const t6 = Date.now();
+  // Referral/handoff closing step ("kya aap Monica ko apne kaam ke liye
+  // lena chahenge?"). The AI only ever DECIDES the stage transition
+  // (referralStage) — the actual phone number is appended here, by code,
+  // so it's always the real configured number and never something the LLM
+  // could get wrong or hallucinate.
+  let outboundText = parsed.reply;
+  const referralPersonName =
+    settings.referral?.personName || env.referral.personName;
+  const referralContactNumber =
+    settings.referral?.contactNumber || env.referral.contactNumber;
+  const referralEnabled = settings.referral?.enabled ?? env.referral.enabled;
 
+  if (
+    referralEnabled &&
+    conversation.referralStatus === "none" &&
+    parsed.referralStage === "ask_now"
+  ) {
+    conversation.referralStatus = "asked";
+    conversation.referralAskedAt = new Date();
+  } else if (
+    conversation.referralStatus === "asked" &&
+    parsed.referralStage === "accepted"
+  ) {
+    conversation.referralStatus = "accepted";
+    conversation.referralRespondedAt = new Date();
+    if (referralContactNumber) {
+      outboundText = `${parsed.reply}\n\n${referralPersonName} ka number: ${referralContactNumber}\nAap directly WhatsApp/call kar sakte hain 🙂`;
+    } else {
+      logger.warn(
+        `[ai] Referral accepted for lead ${lead._id} but no referral contact number is configured (set REFERRAL_CONTACT_NUMBER or Settings.referral.contactNumber)`,
+      );
+    }
+  } else if (
+    conversation.referralStatus === "asked" &&
+    parsed.referralStage === "declined"
+  ) {
+    conversation.referralStatus = "declined";
+    conversation.referralRespondedAt = new Date();
+  }
+
+  // Mirror the key fields back onto Lead so existing list/filter/CSV export UI stays useful.
+  const leadUpdates = {};
+  if (mergedRequirements.city) leadUpdates.city = mergedRequirements.city;
+  if (mergedRequirements.location)
+    leadUpdates.location = mergedRequirements.location;
+  if (mergedRequirements.budgetMin != null)
+    leadUpdates.budgetMin = mergedRequirements.budgetMin;
+  if (mergedRequirements.budgetMax != null)
+    leadUpdates.budgetMax = mergedRequirements.budgetMax;
+  if (Object.keys(leadUpdates).length) {
+    await Lead.updateOne({ _id: lead._id }, { $set: leadUpdates });
+  }
+
+  // Small human-like "typing" pause before sending — kept tight at 3-4s
+  // (randomized so every reply doesn't land at the exact same delay) rather
+  // than the old 2/5/10s Settings dropdown, which could feel too slow.
+  const replyDelayMs = 500 + Math.floor(Math.random() * 500); // 3000-4000ms
+  await new Promise((resolve) => setTimeout(resolve, replyDelayMs));
+
+  // Send the reply out through the Meta WhatsApp Cloud API. This is always a
+  // free-text send here — an inbound customer message is exactly what opens
+  // the 24h customer service window in the first place, so we're always
+  // inside it at this point.
+  let outbound;
   try {
     const { messageId } = await metaWhatsappClient.sendToLead({
       phone: lead.phone,
       text: outboundText,
     });
 
-    logger.info(`[LATENCY] Meta WhatsApp send: ${Date.now() - t6}ms`);
-
-    // existing recordOutboundMessage...
+    outbound = await recordOutboundMessage({
+      conversationId: conversation._id,
+      leadId: lead._id,
+      text: outboundText,
+      sender: "ai",
+      whatsappMessageId: messageId || null,
+      aiPrompt: systemInstruction,
+      aiResponseRaw: raw,
+      intent: parsed.intent,
+      sentiment: parsed.sentiment,
+    });
   } catch (err) {
-    // existing error handling
+    logger.error(
+      `[ai] Failed to send AI reply for lead ${lead._id} via Meta WhatsApp Cloud API`,
+      { error: err.response?.data || err.message },
+    );
+    await Notification.create({
+      userId: conversation.ownerId,
+      type: "whatsapp_send_failed",
+      title: `Couldn't message ${lead.name || "lead"} — WhatsApp send failed`,
+      body: `Sending via WhatsApp failed for ${lead.phone}: ${err.message}`,
+      link: `/leads/${lead._id}`,
+    });
+    emitToUser(conversation.ownerId, "notification:new", { leadId: lead._id });
+    return;
   }
 
-  logger.info(`[LATENCY] TOTAL handleInbound: ${Date.now() - totalStart}ms`);
+  // Buyer just agreed to a site visit — create it automatically.
+  if (parsed.wantsSiteVisit) {
+    await createSiteVisit({
+      lead,
+      conversation,
+      date: parsed.proposedDate,
+      time: parsed.proposedTime,
+      property: candidateProperties[0],
+    });
+  }
 
-  // rest of existing code
+  conversation.requirementsComplete = !!parsed.readyForPropertyRecommendation;
+  await conversation.save();
+
+  emitToUser(conversation.ownerId, "conversation:aiReply", {
+    conversationId: conversation._id,
+    leadId: lead._id,
+    message: outbound,
+  });
+
+  // Lead scoring + follow-up planning runs as a separate Gemini pass, fired
+  // async so the buyer isn't kept waiting on a second model call.
+  analyzeConversationAsync({
+    leadId: lead._id,
+    conversationId: conversation._id,
+  }).catch((err) =>
+    logger.error(`[ai] Async lead analysis failed for lead ${lead._id}`, {
+      error: err.message,
+    }),
+  );
 }
-
-// async function handleInbound({ conversation, lead, message }) {
-//   // Manual takeover or globally paused AI — the broker is handling this chat themselves.
-//   if (conversation.status === "manual" || conversation.status === "closed")
-//     return;
-
-//   const settings = await settingsService.getOrCreateSettings();
-//   if (settings.aiPaused || !settings.autoReplyEnabled) return;
-//   if (settings.whatsappDisconnected) return; // broker hit "Disconnect" on the Settings page
-
-//   const apiKey = await settingsService.getGeminiKey();
-//   if (!apiKey) {
-//     logger.warn(
-//       `[ai] No Gemini API key configured — skipping AI reply for lead ${lead._id}`,
-//     );
-//     return;
-//   }
-
-//   const recentMessages = await Message.find({
-//     conversationId: conversation._id,
-//   })
-//     .sort({ timestamp: -1 })
-//     .limit(HISTORY_LIMIT)
-//     .lean();
-//   recentMessages.reverse(); // oldest -> newest for the model
-
-//   // Pull in any properties that already look like a fit given what we know
-//   // so far, so the model can reference them by name instead of inventing details.
-
-//   const requirements = conversation.collectedRequirements || {};
-
-//   // Single-tenant deployment — matchProperties() searches the whole (one)
-//   // inventory, so no org filter is needed here anymore. matchProperties()
-//   // handles both "no city yet" (returns active inventory) and "city typed
-//   // slightly differently" (soft match + fallback) internally.
-//   const candidateProperties = await matchProperties({
-//     city: requirements.city || lead.city,
-//     location: requirements.location || lead.location,
-//     budgetMin: requirements.budgetMin ?? lead.budgetMin,
-//     budgetMax: requirements.budgetMax ?? lead.budgetMax,
-//     bhk: requirements.bhk,
-//     amenities: requirements.amenities,
-//   });
-
-//   const systemInstruction = buildSystemInstruction({
-//     lead,
-//     settings,
-//     collectedRequirements: requirements,
-//     matchedProperties: candidateProperties,
-//     referralStatus: conversation.referralStatus || "none",
-//     referralPersonName:
-//       settings.referral?.personName || env.referral.personName,
-//   });
-
-//   let result;
-//   try {
-//     result = await generateStructured({
-//       apiKey,
-//       systemInstruction,
-//       history: toGeminiHistory(recentMessages),
-//       responseSchema: REPLY_RESPONSE_SCHEMA,
-//     });
-//   } catch (err) {
-//     logger.error(`[ai] Gemini reply generation failed for lead ${lead._id}`, {
-//       error: err.message,
-//     });
-//     return; // fail silently to the buyer — broker can still see & manually reply from the Conversations page
-//   }
-
-//   const { parsed, raw } = result;
-
-//   // Merge newly extracted requirements into what we already knew (never overwrite with blanks).
-//   const mergedRequirements = mergeRequirements(
-//     requirements,
-//     parsed.extractedRequirements,
-//   );
-//   conversation.collectedRequirements = mergedRequirements;
-//   conversation.lastIntent = parsed.intent;
-//   conversation.lastSentiment = parsed.sentiment;
-//   if (candidateProperties.length) {
-//     // Overwrite, not append — recommendedProperties always reflects the
-//     // CURRENT recommendation set, not a running history of everything ever
-//     // suggested. See Conversation model notes.
-//     conversation.recommendedProperties = candidateProperties.map((p) => p._id);
-//   }
-
-//   // Referral/handoff closing step ("kya aap Monica ko apne kaam ke liye
-//   // lena chahenge?"). The AI only ever DECIDES the stage transition
-//   // (referralStage) — the actual phone number is appended here, by code,
-//   // so it's always the real configured number and never something the LLM
-//   // could get wrong or hallucinate.
-//   let outboundText = parsed.reply;
-//   const referralPersonName =
-//     settings.referral?.personName || env.referral.personName;
-//   const referralContactNumber =
-//     settings.referral?.contactNumber || env.referral.contactNumber;
-//   const referralEnabled = settings.referral?.enabled ?? env.referral.enabled;
-
-//   if (
-//     referralEnabled &&
-//     conversation.referralStatus === "none" &&
-//     parsed.referralStage === "ask_now"
-//   ) {
-//     conversation.referralStatus = "asked";
-//     conversation.referralAskedAt = new Date();
-//   } else if (
-//     conversation.referralStatus === "asked" &&
-//     parsed.referralStage === "accepted"
-//   ) {
-//     conversation.referralStatus = "accepted";
-//     conversation.referralRespondedAt = new Date();
-//     if (referralContactNumber) {
-//       outboundText = `${parsed.reply}\n\n${referralPersonName} ka number: ${referralContactNumber}\nAap directly WhatsApp/call kar sakte hain 🙂`;
-//     } else {
-//       logger.warn(
-//         `[ai] Referral accepted for lead ${lead._id} but no referral contact number is configured (set REFERRAL_CONTACT_NUMBER or Settings.referral.contactNumber)`,
-//       );
-//     }
-//   } else if (
-//     conversation.referralStatus === "asked" &&
-//     parsed.referralStage === "declined"
-//   ) {
-//     conversation.referralStatus = "declined";
-//     conversation.referralRespondedAt = new Date();
-//   }
-
-//   // Mirror the key fields back onto Lead so existing list/filter/CSV export UI stays useful.
-//   const leadUpdates = {};
-//   if (mergedRequirements.city) leadUpdates.city = mergedRequirements.city;
-//   if (mergedRequirements.location)
-//     leadUpdates.location = mergedRequirements.location;
-//   if (mergedRequirements.budgetMin != null)
-//     leadUpdates.budgetMin = mergedRequirements.budgetMin;
-//   if (mergedRequirements.budgetMax != null)
-//     leadUpdates.budgetMax = mergedRequirements.budgetMax;
-//   if (Object.keys(leadUpdates).length) {
-//     await Lead.updateOne({ _id: lead._id }, { $set: leadUpdates });
-//   }
-
-//   // Small human-like "typing" pause before sending — kept tight at 3-4s
-//   // (randomized so every reply doesn't land at the exact same delay) rather
-//   // than the old 2/5/10s Settings dropdown, which could feel too slow.
-//   const replyDelayMs = 500 + Math.floor(Math.random() * 500); // 3000-4000ms
-//   await new Promise((resolve) => setTimeout(resolve, replyDelayMs));
-
-//   // Send the reply out through the Meta WhatsApp Cloud API. This is always a
-//   // free-text send here — an inbound customer message is exactly what opens
-//   // the 24h customer service window in the first place, so we're always
-//   // inside it at this point.
-//   let outbound;
-//   try {
-//     const { messageId } = await metaWhatsappClient.sendToLead({
-//       phone: lead.phone,
-//       text: outboundText,
-//     });
-
-//     outbound = await recordOutboundMessage({
-//       conversationId: conversation._id,
-//       leadId: lead._id,
-//       text: outboundText,
-//       sender: "ai",
-//       whatsappMessageId: messageId || null,
-//       aiPrompt: systemInstruction,
-//       aiResponseRaw: raw,
-//       intent: parsed.intent,
-//       sentiment: parsed.sentiment,
-//     });
-//   } catch (err) {
-//     logger.error(
-//       `[ai] Failed to send AI reply for lead ${lead._id} via Meta WhatsApp Cloud API`,
-//       { error: err.response?.data || err.message },
-//     );
-//     await Notification.create({
-//       userId: conversation.ownerId,
-//       type: "whatsapp_send_failed",
-//       title: `Couldn't message ${lead.name || "lead"} — WhatsApp send failed`,
-//       body: `Sending via WhatsApp failed for ${lead.phone}: ${err.message}`,
-//       link: `/leads/${lead._id}`,
-//     });
-//     emitToUser(conversation.ownerId, "notification:new", { leadId: lead._id });
-//     return;
-//   }
-
-//   // Buyer just agreed to a site visit — create it automatically.
-//   if (parsed.wantsSiteVisit) {
-//     await createSiteVisit({
-//       lead,
-//       conversation,
-//       date: parsed.proposedDate,
-//       time: parsed.proposedTime,
-//       property: candidateProperties[0],
-//     });
-//   }
-
-//   conversation.requirementsComplete = !!parsed.readyForPropertyRecommendation;
-//   await conversation.save();
-
-//   emitToUser(conversation.ownerId, "conversation:aiReply", {
-//     conversationId: conversation._id,
-//     leadId: lead._id,
-//     message: outbound,
-//   });
-
-//   // Lead scoring + follow-up planning runs as a separate Gemini pass, fired
-//   // async so the buyer isn't kept waiting on a second model call.
-//   analyzeConversationAsync({
-//     leadId: lead._id,
-//     conversationId: conversation._id,
-//   }).catch((err) =>
-//     logger.error(`[ai] Async lead analysis failed for lead ${lead._id}`, {
-//       error: err.message,
-//     }),
-//   );
-// }
 
 /**
  * Sends the very first outbound WhatsApp message to a lead.
