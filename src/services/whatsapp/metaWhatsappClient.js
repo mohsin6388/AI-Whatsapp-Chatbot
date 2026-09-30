@@ -1,6 +1,6 @@
-const axios = require('axios');
-const env = require('../../config/env');
-const logger = require('../../utils/logger');
+const axios = require("axios");
+const env = require("../../config/env");
+const logger = require("../../utils/logger");
 
 /**
  * Thin wrapper around the official Meta WhatsApp Cloud API
@@ -28,7 +28,7 @@ const http = axios.create({ timeout: 20_000 });
 function assertConfigured() {
   if (!env.metaWhatsapp.accessToken || !env.metaWhatsapp.phoneNumberId) {
     throw new Error(
-      'Meta WhatsApp Cloud API is not configured — set META_WHATSAPP_ACCESS_TOKEN and META_WHATSAPP_PHONE_NUMBER_ID in the environment'
+      "Meta WhatsApp Cloud API is not configured — set META_WHATSAPP_ACCESS_TOKEN and META_WHATSAPP_PHONE_NUMBER_ID in the environment",
     );
   }
 }
@@ -40,7 +40,7 @@ function baseUrl() {
 function headers() {
   return {
     Authorization: `Bearer ${env.metaWhatsapp.accessToken}`,
-    'Content-Type': 'application/json',
+    "Content-Type": "application/json",
   };
 }
 
@@ -51,8 +51,8 @@ function headers() {
  * storing phone numbers.
  */
 function toWhatsAppNumber(phone) {
-  if (!phone) throw new Error('Phone number is required');
-  let digits = String(phone).replace(/[^\d]/g, '');
+  if (!phone) throw new Error("Phone number is required");
+  let digits = String(phone).replace(/[^\d]/g, "");
   if (!digits) throw new Error(`Phone number "${phone}" has no digits`);
 
   // If a lead was entered as a plain 10-digit Indian mobile number, make it
@@ -88,33 +88,43 @@ function isWithin24HourWindow(lastInboundAt, now = Date.now()) {
  *   [{ type: 'body', parameters: [{ type: 'text', text: lead.name }] }]
  * Pass [] / omit if the approved template has no variables.
  */
-async function sendTemplateMessage({ phone, templateName, languageCode, components = [] }) {
+async function sendTemplateMessage({
+  phone,
+  templateName,
+  languageCode,
+  components = [],
+}) {
   assertConfigured();
   if (!templateName) {
     throw new Error(
-      'No WhatsApp template name configured — set META_WHATSAPP_OPENING_TEMPLATE_NAME once your template is approved in WhatsApp Manager'
+      "No WhatsApp template name configured — set META_WHATSAPP_OPENING_TEMPLATE_NAME once your template is approved in WhatsApp Manager",
     );
   }
 
   const payload = {
-    messaging_product: 'whatsapp',
+    messaging_product: "whatsapp",
     to: toWhatsAppNumber(phone),
-    type: 'template',
+    type: "template",
     template: {
       name: templateName,
-      language: { code: languageCode || env.metaWhatsapp.openingTemplateLanguage },
+      language: {
+        code: languageCode || env.metaWhatsapp.openingTemplateLanguage,
+      },
       ...(components.length ? { components } : {}),
     },
   };
 
   try {
-    const { data } = await http.post(`${baseUrl()}/messages`, payload, { headers: headers() });
+    const { data } = await http.post(`${baseUrl()}/messages`, payload, {
+      headers: headers(),
+    });
     return { messageId: extractMessageId(data), raw: data };
   } catch (err) {
     const metaError = err.response?.data?.error;
-    const message = metaError?.message || err.message || 'Meta WhatsApp template send failed';
+    const message =
+      metaError?.message || err.message || "Meta WhatsApp template send failed";
     const apiError = new Error(message);
-    apiError.code = metaError?.code || 'META_TEMPLATE_SEND_FAILED';
+    apiError.code = metaError?.code || "META_TEMPLATE_SEND_FAILED";
     apiError.metaError = metaError || null;
     apiError.response = err.response;
     throw apiError;
@@ -130,14 +140,16 @@ async function sendTextMessage({ phone, text }) {
   assertConfigured();
 
   const payload = {
-    messaging_product: 'whatsapp',
+    messaging_product: "whatsapp",
     to: toWhatsAppNumber(phone),
-    type: 'text',
+    type: "text",
     text: { body: text, preview_url: false },
   };
 
   try {
-    const { data } = await http.post(`${baseUrl()}/messages`, payload, { headers: headers() });
+    const { data } = await http.post(`${baseUrl()}/messages`, payload, {
+      headers: headers(),
+    });
     return { messageId: extractMessageId(data), raw: data };
   } catch (err) {
     const metaError = err.response?.data?.error;
@@ -146,14 +158,19 @@ async function sendTextMessage({ phone, text }) {
     // callers can decide whether to fall back to a template instead of just
     // logging a generic axios error.
     if (metaError?.code === 131047) {
-      const windowErr = new Error('WHATSAPP_24H_WINDOW_CLOSED: ' + (metaError.message || 'Re-engagement message'));
-      windowErr.code = 'WHATSAPP_24H_WINDOW_CLOSED';
+      const windowErr = new Error(
+        "WHATSAPP_24H_WINDOW_CLOSED: " +
+          (metaError.message || "Re-engagement message"),
+      );
+      windowErr.code = "WHATSAPP_24H_WINDOW_CLOSED";
       windowErr.metaError = metaError;
       throw windowErr;
     }
 
-    const apiError = new Error(metaError?.message || err.message || 'Meta WhatsApp message send failed');
-    apiError.code = metaError?.code || 'META_WHATSAPP_SEND_FAILED';
+    const apiError = new Error(
+      metaError?.message || err.message || "Meta WhatsApp message send failed",
+    );
+    apiError.code = metaError?.code || "META_WHATSAPP_SEND_FAILED";
     apiError.metaError = metaError || null;
     apiError.response = err.response;
     throw apiError;
@@ -178,11 +195,45 @@ async function markAsRead(whatsappMessageId) {
   try {
     await http.post(
       `${baseUrl()}/messages`,
-      { messaging_product: 'whatsapp', status: 'read', message_id: whatsappMessageId },
-      { headers: headers() }
+      {
+        messaging_product: "whatsapp",
+        status: "read",
+        message_id: whatsappMessageId,
+      },
+      { headers: headers() },
     );
   } catch (err) {
-    logger.warn('[meta-whatsapp] Failed to mark message as read (non-fatal)', { error: err.response?.data || err.message });
+    logger.warn("[meta-whatsapp] Failed to mark message as read (non-fatal)", {
+      error: err.response?.data || err.message,
+    });
+  }
+}
+
+async function sendTypingIndicator(messageId) {
+  if (!messageId) {
+    return;
+  }
+
+  try {
+    await http.post(`/${PHONE_NUMBER_ID}/messages`, {
+      messaging_product: "whatsapp",
+      status: "read",
+      message_id: messageId,
+      typing_indicator: {
+        type: "text",
+      },
+    });
+
+    logger.info("[whatsapp] Typing indicator sent", {
+      messageId,
+    });
+  } catch (err) {
+    // Typing indicator must NEVER break the AI reply flow.
+    logger.warn("[whatsapp] Failed to send typing indicator", {
+      messageId,
+      error: err.message,
+      response: err.response?.data,
+    });
   }
 }
 
@@ -201,20 +252,24 @@ async function markAsRead(whatsappMessageId) {
 async function ensureWabaSubscription() {
   assertConfigured();
   if (!env.metaWhatsapp.businessAccountId) {
-    throw new Error('META_WHATSAPP_BUSINESS_ACCOUNT_ID is not configured');
+    throw new Error("META_WHATSAPP_BUSINESS_ACCOUNT_ID is not configured");
   }
 
   try {
     const { data } = await http.post(
       `https://graph.facebook.com/${env.metaWhatsapp.apiVersion}/${env.metaWhatsapp.businessAccountId}/subscribed_apps`,
       {},
-      { headers: headers() }
+      { headers: headers() },
     );
     return data;
   } catch (err) {
     const metaError = err.response?.data?.error;
-    const apiError = new Error(metaError?.message || err.message || 'Failed to subscribe Meta app to WhatsApp Business Account');
-    apiError.code = metaError?.code || 'META_WABA_SUBSCRIBE_FAILED';
+    const apiError = new Error(
+      metaError?.message ||
+        err.message ||
+        "Failed to subscribe Meta app to WhatsApp Business Account",
+    );
+    apiError.code = metaError?.code || "META_WABA_SUBSCRIBE_FAILED";
     apiError.metaError = metaError || null;
     apiError.response = err.response;
     throw apiError;
@@ -224,10 +279,16 @@ async function ensureWabaSubscription() {
 async function getAccountInfo() {
   assertConfigured();
 
-  const { data } = await http.get(`https://graph.facebook.com/${env.metaWhatsapp.apiVersion}/${env.metaWhatsapp.phoneNumberId}`, {
-    headers: headers(),
-    params: { fields: 'display_phone_number,verified_name,quality_rating,code_verification_status' },
-  });
+  const { data } = await http.get(
+    `https://graph.facebook.com/${env.metaWhatsapp.apiVersion}/${env.metaWhatsapp.phoneNumberId}`,
+    {
+      headers: headers(),
+      params: {
+        fields:
+          "display_phone_number,verified_name,quality_rating,code_verification_status",
+      },
+    },
+  );
 
   return {
     phoneNumber: data?.display_phone_number || null,
@@ -241,18 +302,20 @@ async function getAccountInfo() {
 async function getWabaPhoneNumbers() {
   assertConfigured();
   if (!env.metaWhatsapp.businessAccountId) {
-    throw new Error('META_WHATSAPP_BUSINESS_ACCOUNT_ID is not configured');
+    throw new Error("META_WHATSAPP_BUSINESS_ACCOUNT_ID is not configured");
   }
   try {
     const { data } = await http.get(
       `https://graph.facebook.com/${env.metaWhatsapp.apiVersion}/${env.metaWhatsapp.businessAccountId}/phone_numbers`,
-      { headers: headers() }
+      { headers: headers() },
     );
     return data;
   } catch (err) {
     const metaError = err.response?.data?.error;
-    const apiError = new Error(metaError?.message || err.message || 'Failed to read WABA phone numbers');
-    apiError.code = metaError?.code || 'META_WABA_PHONE_NUMBERS_FAILED';
+    const apiError = new Error(
+      metaError?.message || err.message || "Failed to read WABA phone numbers",
+    );
+    apiError.code = metaError?.code || "META_WABA_PHONE_NUMBERS_FAILED";
     apiError.metaError = metaError || null;
     apiError.response = err.response;
     throw apiError;
@@ -269,7 +332,9 @@ async function verifyConfiguration() {
   return {
     account,
     wabaPhoneNumbers,
-    phoneNumberBelongsToWaba: env.metaWhatsapp.businessAccountId ? ids.includes(String(env.metaWhatsapp.phoneNumberId)) : null,
+    phoneNumberBelongsToWaba: env.metaWhatsapp.businessAccountId
+      ? ids.includes(String(env.metaWhatsapp.phoneNumberId))
+      : null,
   };
 }
 
@@ -278,6 +343,7 @@ module.exports = {
   sendTextMessage,
   sendToLead,
   markAsRead,
+  sendTypingIndicator,
   getAccountInfo,
   toWhatsAppNumber,
   isWithin24HourWindow,

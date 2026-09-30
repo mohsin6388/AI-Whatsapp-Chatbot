@@ -1,12 +1,12 @@
-const Lead = require('../../models/Lead');
-const Conversation = require('../../models/Conversation');
-const Message = require('../../models/Message');
-const User = require('../../models/User');
-const Notification = require('../../models/Notification');
-const logger = require('../../utils/logger');
-const { emitToUser } = require('../../sockets');
-const conversationEngine = require('../ai/conversationEngine');
-const env = require('../../config/env');
+const Lead = require("../../models/Lead");
+const Conversation = require("../../models/Conversation");
+const Message = require("../../models/Message");
+const User = require("../../models/User");
+const Notification = require("../../models/Notification");
+const logger = require("../../utils/logger");
+const { emitToUser } = require("../../sockets");
+const conversationEngine = require("../ai/conversationEngine");
+const env = require("../../config/env");
 
 /**
  * Real Meta WhatsApp Cloud API "messages" webhook body:
@@ -43,7 +43,7 @@ const env = require('../../config/env');
  */
 function normalizePhone(rawPhone) {
   if (!rawPhone) return null;
-  const digits = String(rawPhone).replace(/[^\d]/g, '');
+  const digits = String(rawPhone).replace(/[^\d]/g, "");
   return digits || null;
 }
 
@@ -84,18 +84,24 @@ let cachedOwnerAt = 0;
 const OWNER_CACHE_MS = 5 * 60 * 1000;
 
 async function resolveDefaultOwner() {
-  if (cachedOwner && Date.now() - cachedOwnerAt < OWNER_CACHE_MS) return cachedOwner;
+  if (cachedOwner && Date.now() - cachedOwnerAt < OWNER_CACHE_MS)
+    return cachedOwner;
 
   let owner = null;
   if (env.leads.defaultOwnerId) {
     owner = await User.findById(env.leads.defaultOwnerId);
     if (!owner) {
-      logger.warn(`[whatsapp] DEFAULT_LEAD_OWNER_ID=${env.leads.defaultOwnerId} does not match any User — falling back`);
+      logger.warn(
+        `[whatsapp] DEFAULT_LEAD_OWNER_ID=${env.leads.defaultOwnerId} does not match any User — falling back`,
+      );
     }
   }
 
   if (!owner) {
-    owner = await User.findOne({ role: { $in: ['broker', 'builder', 'admin'] }, isActive: true }).sort({ createdAt: 1 });
+    owner = await User.findOne({
+      role: { $in: ["broker", "builder", "admin"] },
+      isActive: true,
+    }).sort({ createdAt: 1 });
   }
 
   if (owner) {
@@ -116,7 +122,10 @@ async function findOrCreateConversation(lead) {
   if (conversation) return conversation;
 
   try {
-    conversation = await Conversation.create({ leadId: lead._id, ownerId: lead.ownerId });
+    conversation = await Conversation.create({
+      leadId: lead._id,
+      ownerId: lead.ownerId,
+    });
   } catch (err) {
     if (err.code === 11000) {
       conversation = await Conversation.findOne({ leadId: lead._id });
@@ -138,7 +147,7 @@ async function createLeadForUnknownSender(phone, contactName) {
   const owner = await resolveDefaultOwner();
   if (!owner) {
     logger.warn(
-      `[whatsapp] Inbound message from unrecognized number ${phone} — no default lead owner configured (set DEFAULT_LEAD_OWNER_ID or create a broker/admin user), ignoring`
+      `[whatsapp] Inbound message from unrecognized number ${phone} — no default lead owner configured (set DEFAULT_LEAD_OWNER_ID or create a broker/admin user), ignoring`,
     );
     return null;
   }
@@ -153,7 +162,7 @@ async function createLeadForUnknownSender(phone, contactName) {
       ownerId: owner._id,
       name: contactName || `WhatsApp ${phone}`,
       phone,
-      source: 'whatsapp_inbound',
+      source: "whatsapp_inbound",
     });
   } catch (err) {
     if (err.code === 11000) {
@@ -166,17 +175,19 @@ async function createLeadForUnknownSender(phone, contactName) {
 
   const conversation = await findOrCreateConversation(lead);
 
-  logger.info(`[whatsapp] Auto-created new lead ${lead._id} for unrecognized inbound number ${phone}`);
+  logger.info(
+    `[whatsapp] Auto-created new lead ${lead._id} for unrecognized inbound number ${phone}`,
+  );
 
   await Notification.create({
     userId: owner._id,
-    type: 'new_lead',
+    type: "new_lead",
     title: `New WhatsApp message from ${phone}`,
-    body: 'This number messaged you first and was added as a new lead automatically.',
+    body: "This number messaged you first and was added as a new lead automatically.",
     link: `/leads/${lead._id}`,
   });
-  emitToUser(owner._id, 'notification:new', { leadId: lead._id });
-  emitToUser(owner._id, 'lead:new', { lead });
+  emitToUser(owner._id, "notification:new", { leadId: lead._id });
+  emitToUser(owner._id, "lead:new", { lead });
 
   return { lead, conversation };
 }
@@ -190,24 +201,24 @@ async function createLeadForUnknownSender(phone, contactName) {
  */
 function extractText(msg) {
   switch (msg.type) {
-    case 'text':
-      return msg.text?.body?.trim() || '';
-    case 'button':
+    case "text":
+      return msg.text?.body?.trim() || "";
+    case "button":
       // Quick-reply button on a template we sent earlier.
-      return msg.button?.text?.trim() || '';
-    case 'interactive':
+      return msg.button?.text?.trim() || "";
+    case "interactive":
       return (
         msg.interactive?.button_reply?.title?.trim() ||
         msg.interactive?.list_reply?.title?.trim() ||
-        ''
+        ""
       );
     default:
-      return '';
+      return "";
   }
 }
 
 function placeholderTextFor(msg) {
-  return `[${msg.type || 'media'} message — not yet supported for preview]`;
+  return `[${msg.type || "media"} message — not yet supported for preview]`;
 }
 
 /**
@@ -222,7 +233,10 @@ async function handleInboundMessage(waMessage, contact) {
 
   const phone = normalizePhone(waMessage.from);
   if (!phone) {
-    logger.warn('[whatsapp] Webhook message had no resolvable sender phone number, ignoring', { messageId: waMessage.id });
+    logger.warn(
+      "[whatsapp] Webhook message had no resolvable sender phone number, ignoring",
+      { messageId: waMessage.id },
+    );
     return;
   }
 
@@ -233,7 +247,10 @@ async function handleInboundMessage(waMessage, contact) {
     // Brand-new number we've never seen before — auto-create the lead
     // (and its conversation) so the AI can respond to them too, instead
     // of only ever replying to numbers that were imported/added first.
-    const created = await createLeadForUnknownSender(phone, contact?.profile?.name);
+    const created = await createLeadForUnknownSender(
+      phone,
+      contact?.profile?.name,
+    );
     if (!created) return; // no default owner configured — see createLeadForUnknownSender for how to fix
     ({ lead, conversation } = created);
   } else {
@@ -247,13 +264,15 @@ async function handleInboundMessage(waMessage, contact) {
   }
 
   const timestampSec = Number(waMessage.timestamp);
-  const timestamp = Number.isFinite(timestampSec) ? new Date(timestampSec * 1000) : new Date();
+  const timestamp = Number.isFinite(timestampSec)
+    ? new Date(timestampSec * 1000)
+    : new Date();
 
   const savedMessage = await Message.create({
     conversationId: conversation._id,
     leadId: lead._id,
-    direction: 'inbound',
-    sender: 'customer',
+    direction: "inbound",
+    sender: "customer",
     text,
     whatsappMessageId: whatsappMessageId || null,
     timestamp,
@@ -267,22 +286,34 @@ async function handleInboundMessage(waMessage, contact) {
   conversation.templateSent = true;
   await conversation.save();
 
-  emitToUser(lead.ownerId, 'conversation:newMessage', {
+  emitToUser(lead.ownerId, "conversation:newMessage", {
     conversationId: conversation._id,
     leadId: lead._id,
     message: savedMessage,
   });
 
   // Fire-and-forget best-effort blue ticks; never block the AI turn on this.
-  require('./metaWhatsappClient').markAsRead(whatsappMessageId).catch(() => {});
+  require("./metaWhatsappClient")
+    .markAsRead(whatsappMessageId)
+    .catch(() => {});
+
+  require("./metaWhatsappClient")
+    .sendTypingIndicator(whatsappMessageId)
+    .catch(() => {});
 
   // Hand off to the AI engine. Awaited so replies for a given lead stay in
   // order, but wrapped in its own try/catch — an AI failure must never
   // surface back as a webhook failure (which would trigger Meta retries).
   try {
-    await conversationEngine.handleInbound({ conversation, lead, message: savedMessage });
+    await conversationEngine.handleInbound({
+      conversation,
+      lead,
+      message: savedMessage,
+    });
   } catch (aiErr) {
-    logger.error(`[ai] Conversation engine failed for lead ${lead._id}`, { error: aiErr.message });
+    logger.error(`[ai] Conversation engine failed for lead ${lead._id}`, {
+      error: aiErr.message,
+    });
   }
 }
 
@@ -295,13 +326,13 @@ async function handleInboundMessage(waMessage, contact) {
  */
 async function handleWebhook(payload) {
   try {
-    if (!payload || payload.object !== 'whatsapp_business_account') return;
+    if (!payload || payload.object !== "whatsapp_business_account") return;
 
     const entries = Array.isArray(payload.entry) ? payload.entry : [];
     for (const entry of entries) {
       const changes = Array.isArray(entry.changes) ? entry.changes : [];
       for (const change of changes) {
-        if (change.field !== 'messages') continue; // ignore non-message webhook fields
+        if (change.field !== "messages") continue; // ignore non-message webhook fields
         const value = change.value || {};
 
         // Status callbacks (sent/delivered/read/failed for OUR outbound
@@ -309,7 +340,14 @@ async function handleWebhook(payload) {
         // nothing to do with them yet, just don't treat them as inbound text.
         if (Array.isArray(value.statuses) && value.statuses.length) {
           for (const s of value.statuses) {
-            const mappedStatus = ['sent', 'delivered', 'read', 'failed'].includes(s.status) ? s.status : null;
+            const mappedStatus = [
+              "sent",
+              "delivered",
+              "read",
+              "failed",
+            ].includes(s.status)
+              ? s.status
+              : null;
             if (mappedStatus && s.id) {
               const firstError = Array.isArray(s.errors) ? s.errors[0] : null;
               await Message.updateOne(
@@ -317,14 +355,20 @@ async function handleWebhook(payload) {
                 {
                   $set: {
                     status: mappedStatus,
-                    errorCode: firstError?.code ? String(firstError.code) : null,
-                    errorMessage: firstError?.title || firstError?.message || null,
+                    errorCode: firstError?.code
+                      ? String(firstError.code)
+                      : null,
+                    errorMessage:
+                      firstError?.title || firstError?.message || null,
                   },
-                }
+                },
               );
             }
-            if (s.status === 'failed') {
-              logger.warn('[whatsapp] Outbound message delivery failed', { messageId: s.id, errors: s.errors });
+            if (s.status === "failed") {
+              logger.warn("[whatsapp] Outbound message delivery failed", {
+                messageId: s.id,
+                errors: s.errors,
+              });
             }
           }
         }
@@ -332,16 +376,25 @@ async function handleWebhook(payload) {
         const messages = Array.isArray(value.messages) ? value.messages : [];
         if (!messages.length) continue;
 
-        const contactsByWaId = new Map((value.contacts || []).map((c) => [c.wa_id, c]));
+        const contactsByWaId = new Map(
+          (value.contacts || []).map((c) => [c.wa_id, c]),
+        );
 
         for (const waMessage of messages) {
-          logger.info(`[whatsapp] Webhook message received: type=${waMessage.type} from=${waMessage.from} id=${waMessage.id}`);
-          await handleInboundMessage(waMessage, contactsByWaId.get(waMessage.from));
+          logger.info(
+            `[whatsapp] Webhook message received: type=${waMessage.type} from=${waMessage.from} id=${waMessage.id}`,
+          );
+          await handleInboundMessage(
+            waMessage,
+            contactsByWaId.get(waMessage.from),
+          );
         }
       }
     }
   } catch (err) {
-    logger.error('[whatsapp] Failed to process webhook payload', { error: err.message });
+    logger.error("[whatsapp] Failed to process webhook payload", {
+      error: err.message,
+    });
   }
 }
 
