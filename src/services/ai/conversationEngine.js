@@ -56,15 +56,20 @@ async function handleInbound({ conversation, lead, message }) {
   // so far, so the model can reference them by name instead of inventing details.
 
   const requirements = conversation.collectedRequirements || {};
+
   const currentMessage = message?.text || "";
 
   const candidateProperties = await matchProperties({
     query: currentMessage,
+
     city: requirements.city || lead.city,
     location: requirements.location || lead.location,
+
     projectName: requirements.projectName,
+
     budgetMin: requirements.budgetMin ?? lead.budgetMin,
     budgetMax: requirements.budgetMax ?? lead.budgetMax,
+
     bhk: requirements.bhk,
     propertyType: requirements.propertyType,
     amenities: requirements.amenities || [],
@@ -76,10 +81,13 @@ async function handleInbound({ conversation, lead, message }) {
     collectedRequirements: requirements,
     matchedProperties: candidateProperties,
     currentMessage,
+
     referralStatus: conversation.referralStatus || "none",
+
     referralPersonName:
       settings.referral?.personName || env.referral.personName,
   });
+
   let result;
   try {
     result = await generateStructured({

@@ -1,18 +1,28 @@
 const Property = require("../../models/Property");
 
 /**
- * Finds and ranks properties matching the buyer's current question
- * and known requirements.
+ * Property Matcher
  *
- * Important:
- * - Current customer message has priority over old requirements.
- * - Project names are detected directly from the property inventory.
- * - "other city" questions ignore the previous city filter.
- * - "other property/project" questions exclude the project already mentioned.
- * - Specific project questions prioritize that exact project.
- * - Broad city/project questions return representative properties from
- *   different projects instead of repeatedly returning units from one project.
+ * IMPORTANT PRIORITY:
+ * 1. Current customer message
+ * 2. Explicit project/city mentioned in current message
+ * 3. Current requirements
+ * 4. Old conversation requirements
+ *
+ * Supported:
+ * - Complete property/project list
+ * - City-wise property list
+ * - Specific project lookup
+ * - Other project lookup
+ * - Other city lookup
+ * - Budget matching
+ * - BHK matching
+ * - Property type matching
+ * - Location matching
+ * - Amenities matching
+ * - Current message overriding old context
  */
+
 async function matchProperties(
   {
     query = "",
@@ -27,163 +37,233 @@ async function matchProperties(
   },
   limit = 5,
 ) {
-  const activeFilter = { isActive: true };
+  const activeFilter = {
+    isActive: true,
+  };
 
   // ---------------------------------------------------------
-  // 1. Load active inventory first.
+  // 1. LOAD COMPLETE ACTIVE INVENTORY
   // ---------------------------------------------------------
-  let allProperties = await Property.find(activeFilter).limit(500).lean();
 
-  if (!allProperties.length) return [];
+  const allProperties = await Property.find(activeFilter).limit(1000).lean();
+
+  if (!allProperties.length) {
+    return [];
+  }
 
   const normalizedQuery = normalize(query);
 
   // ---------------------------------------------------------
-  // 2. Detect whether customer is asking for another city.
-  //
-  // Example:
-  // "koi aur city me hai?"
-  // "kisi aur city me property hai?"
-  // "aur kisi shehar me?"
-  //
-  // In this case, DO NOT use the old Noida city filter.
+  // 2. CURRENT MESSAGE DETECTION
   // ---------------------------------------------------------
-  const askingOtherCity = isOtherCityQuestion(normalizedQuery);
 
-  // ---------------------------------------------------------
-  // 3. Detect whether customer is asking for other properties.
-  //
-  // Example:
-  // "The Sunflower ke alawa koi aur property hai?"
-  // ---------------------------------------------------------
-  const askingOtherProperty = isOtherPropertyQuestion(normalizedQuery);
-
-  // ---------------------------------------------------------
-  // 4. Find exact/known project mentioned in current message.
-  //
-  // We search project names from DB instead of asking Gemini
-  // to invent/extract the project name first.
-  // ---------------------------------------------------------
   const detectedProject = findProjectMentioned(allProperties, normalizedQuery);
 
-  // Explicit projectName from conversation memory has lower priority
-  // than a project clearly mentioned in the CURRENT message.
-  const activeProjectName = detectedProject?.projectName || projectName || null;
-
-  // ---------------------------------------------------------
-  // 5. Detect a city mentioned in the CURRENT message.
-  //
-  // Example:
-  // Previous city = Noida
-  // Customer = "Kanpur me kya hai?"
-  //
-  // Current city becomes Kanpur.
-  // ---------------------------------------------------------
   const detectedCity = findCityMentioned(allProperties, normalizedQuery);
 
-  let effectiveCity = city;
+  const askingOtherCity = isOtherCityQuestion(normalizedQuery);
+
+  const askingOtherProperty = isOtherPropertyQuestion(normalizedQuery);
+
+  const askingCompleteInventory = isCompleteInventoryQuestion(normalizedQuery);
+
+  const askingCityInventory = isCityInventoryQuestion(normalizedQuery);
+
+  const askingAllProjects = isAllProjectListQuestion(normalizedQuery);
+
+  // ---------------------------------------------------------
+  // 3. CURRENT MESSAGE HAS HIGHEST PRIORITY
+  // ---------------------------------------------------------
+
+  let effectiveCity = city || null;
+
+  let effectiveProjectName = projectName || null;
 
   if (detectedCity) {
     effectiveCity = detectedCity;
   }
 
-  // "koi aur city" means search the whole inventory.
+  if (detectedProject?.projectName) {
+    effectiveProjectName = detectedProject.projectName;
+  }
+
+  // ---------------------------------------------------------
+  // 4. "OTHER CITY" MEANS IGNORE OLD CITY
+  // ---------------------------------------------------------
+
   if (askingOtherCity) {
     effectiveCity = null;
+    effectiveProjectName = null;
   }
 
   // ---------------------------------------------------------
-  // 6. Decide if this is a broad inventory question.
+  // 5. SPECIFIC PROJECT QUESTION
+  //
+  // Example:
+  // "Ivory hai?"
+  // "Ivory ka price kya hai?"
+  // "Jade County ki details batao"
   // ---------------------------------------------------------
-  const askingCityProjects = isCityProjectListQuestion(normalizedQuery);
 
-  const askingAllProjects = isAllProjectListQuestion(normalizedQuery);
+  if (detectedProject?.projectName) {
+    const projectProperties = allProperties.filter((property) =>
+      sameProject(property.projectName, detectedProject.projectName),
+    );
+
+    if (projectProperties.length) {
+      return projectProperties;
+    }
+  }
 
   // ---------------------------------------------------------
-  // 7. Build initial candidate pool.
+  // 6. COMPLETE INVENTORY QUESTION
+  //
+  // Example:
+  // "tumhare paas kitni properties hain?"
+  // "puri list do"
+  // "kaun kaun si properties hain?"
+  //
+  // IMPORTANT:
+  // Do NOT apply limit = 5 here.
+  // Return every unique project.
   // ---------------------------------------------------------
+
+  if (askingCompleteInventory || askingAllProjects) {
+    return getUniqueProjects(allProperties);
+  }
+
+  // ---------------------------------------------------------
+  // 7. EXPLICIT CITY QUESTION
+  //
+  // Example:
+  // "Noida mein kya properties hain?"
+  // "Kanpur mein kya hai?"
+  //
+  // Current city overrides old city.
+  // ---------------------------------------------------------
+
+  if (detectedCity) {
+    const cityProperties = allProperties.filter((property) =>
+      sameCity(property.city, detectedCity),
+    );
+
+    if (askingCityInventory) {
+      return getUniqueProjects(cityProperties);
+    }
+
+    // If user asks a normal question about this city,
+    // use only properties from this city.
+    return getMatchedProperties(
+      cityProperties,
+      {
+        query: normalizedQuery,
+        location,
+        budgetMin,
+        budgetMax,
+        bhk,
+        propertyType,
+        amenities,
+      },
+      limit,
+    );
+  }
+
+  // ---------------------------------------------------------
+  // 8. OTHER PROPERTY / OTHER PROJECT
+  //
+  // Example:
+  // "Sunflower ke alawa aur kya hai?"
+  //
+  // If a project was mentioned, exclude that project.
+  // ---------------------------------------------------------
+
+  if (askingOtherProperty && detectedProject?.projectName) {
+    let otherProperties = allProperties.filter(
+      (property) =>
+        !sameProject(property.projectName, detectedProject.projectName),
+    );
+
+    // If there is an old/current city requirement,
+    // respect it unless user explicitly asks another city.
+    if (effectiveCity) {
+      const cityFiltered = otherProperties.filter((property) =>
+        sameCity(property.city, effectiveCity),
+      );
+
+      if (cityFiltered.length) {
+        otherProperties = cityFiltered;
+      }
+    }
+
+    return getUniqueProjects(otherProperties);
+  }
+
+  // ---------------------------------------------------------
+  // 9. OTHER CITY QUESTION
+  //
+  // Example:
+  // "koi aur city mein property hai?"
+  // "Noida ke alawa kisi aur city mein kya hai?"
+  //
+  // Do NOT use old city filter.
+  // ---------------------------------------------------------
+
+  if (askingOtherCity) {
+    let otherCityProperties = allProperties;
+
+    // If old city exists, remove it.
+    if (city) {
+      otherCityProperties = allProperties.filter(
+        (property) => !sameCity(property.city, city),
+      );
+    }
+
+    return getUniqueProjects(otherCityProperties);
+  }
+
+  // ---------------------------------------------------------
+  // 10. PROJECT NAME FROM OLD REQUIREMENTS
+  //
+  // Current message did not contain a project,
+  // but conversation requirements may have one.
+  // ---------------------------------------------------------
+
+  if (effectiveProjectName) {
+    const requirementProjectProperties = allProperties.filter((property) =>
+      sameProject(property.projectName, effectiveProjectName),
+    );
+
+    if (requirementProjectProperties.length) {
+      return requirementProjectProperties;
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 11. CITY FROM OLD REQUIREMENTS
+  //
+  // Only use old city if current message did not mention
+  // another city/project.
+  // ---------------------------------------------------------
+
   let candidates = allProperties;
 
-  // Specific project mentioned:
-  // search the whole inventory because the customer may ask
-  // "Ivory" even when old conversation city was Noida.
-  if (activeProjectName) {
-    candidates = candidates.filter((property) =>
-      sameProject(property.projectName, activeProjectName),
-    );
-  } else if (effectiveCity) {
-    candidates = candidates.filter((property) =>
+  if (effectiveCity) {
+    const cityCandidates = allProperties.filter((property) =>
       sameCity(property.city, effectiveCity),
     );
+
+    if (cityCandidates.length) {
+      candidates = cityCandidates;
+    }
   }
 
   // ---------------------------------------------------------
-  // 8. "Other property" question.
-  //
-  // Example:
-  // "The Sunflower ke alawa koi aur property hai?"
-  //
-  // If The Sunflower is detected, remove it from the results.
+  // 12. NORMAL REQUIREMENT MATCHING
   // ---------------------------------------------------------
-  if (askingOtherProperty && detectedProject?.projectName) {
-    candidates = allProperties.filter((property) => {
-      if (effectiveCity && !sameCity(property.city, effectiveCity)) {
-        return false;
-      }
 
-      return !sameProject(property.projectName, detectedProject.projectName);
-    });
-  }
-
-  // ---------------------------------------------------------
-  // 9. If customer asks for another city and no explicit city
-  // was mentioned, search entire inventory.
-  // ---------------------------------------------------------
-  if (askingOtherCity && !detectedCity) {
-    candidates = allProperties;
-  }
-
-  // ---------------------------------------------------------
-  // 10. Safety fallback.
-  //
-  // Never tell AI "no properties" merely because the old city
-  // filter was too restrictive.
-  // ---------------------------------------------------------
-  if (!candidates.length) {
-    candidates = allProperties;
-  }
-
-  // ---------------------------------------------------------
-  // 11. Broad city/project listing.
-  //
-  // Example:
-  // "Noida me kaun kaun se projects hain?"
-  //
-  // We want different projects, not 5 units of the same project.
-  // ---------------------------------------------------------
-  if (askingCityProjects || askingAllProjects) {
-    return getUniqueProjects(candidates, limit);
-  }
-
-  // ---------------------------------------------------------
-  // 12. Specific project question.
-  //
-  // Example:
-  // "Ivory ka price kya hai?"
-  // "Ivory ke paas metro hai?"
-  //
-  // Return all units of that project so Gemini has complete data.
-  // ---------------------------------------------------------
-  if (activeProjectName) {
-    return candidates.slice(0, 20);
-  }
-
-  // ---------------------------------------------------------
-  // 13. Normal requirement-based matching.
-  // ---------------------------------------------------------
-  const scored = candidates.map((property) => ({
-    property,
-    score: scoreMatch(property, {
+  return getMatchedProperties(
+    candidates,
+    {
       query: normalizedQuery,
       location,
       budgetMin,
@@ -191,105 +271,174 @@ async function matchProperties(
       bhk,
       propertyType,
       amenities,
-    }),
+    },
+    limit,
+  );
+}
+
+/**
+ * ---------------------------------------------------------
+ * GET MATCHED PROPERTIES
+ * ---------------------------------------------------------
+ *
+ * Used for normal recommendation questions.
+ *
+ * Example:
+ * - 2 BHK
+ * - under 80 lakh
+ * - apartment
+ * - near metro
+ * - specific location
+ */
+function getMatchedProperties(properties, requirements, limit = 5) {
+  if (!properties.length) {
+    return [];
+  }
+
+  const scored = properties.map((property) => ({
+    property,
+    score: scoreMatch(property, requirements),
   }));
 
   scored.sort((a, b) => b.score - a.score);
 
   const positive = scored.filter((item) => item.score > 0);
 
-  const pool = positive.length ? positive : scored;
+  const pool = positive.length > 0 ? positive : scored;
 
   return pool.slice(0, limit).map((item) => item.property);
 }
 
 /**
- * Scores a property against known buyer requirements.
+ * ---------------------------------------------------------
+ * SCORE PROPERTY
+ * ---------------------------------------------------------
  */
 function scoreMatch(
   property,
-  { query, location, budgetMin, budgetMax, bhk, propertyType, amenities },
+  { query, location, budgetMin, budgetMax, bhk, propertyType, amenities = [] },
 ) {
   let score = 1;
 
-  // ---------------------------------------------------------
-  // Project name mentioned in current question
-  // ---------------------------------------------------------
+  // -------------------------------------------------------
+  // PROJECT NAME
+  // -------------------------------------------------------
+
   if (
     query &&
     property.projectName &&
     containsText(query, property.projectName)
   ) {
-    score += 10;
+    score += 50;
   }
 
-  // ---------------------------------------------------------
-  // Property type
-  // ---------------------------------------------------------
+  // -------------------------------------------------------
+  // BUILDER
+  // -------------------------------------------------------
+
   if (
-    propertyType &&
-    property.propertyType &&
-    normalize(property.propertyType).includes(normalize(propertyType))
+    query &&
+    property.builderName &&
+    containsText(query, property.builderName)
   ) {
-    score += 3;
+    score += 15;
   }
 
-  // ---------------------------------------------------------
-  // Budget
-  // ---------------------------------------------------------
+  // -------------------------------------------------------
+  // PROPERTY TYPE
+  // -------------------------------------------------------
+
+  if (propertyType && property.propertyType) {
+    const wantedType = normalize(propertyType);
+
+    const actualType = normalize(property.propertyType);
+
+    if (actualType.includes(wantedType) || wantedType.includes(actualType)) {
+      score += 10;
+    }
+  }
+
+  // -------------------------------------------------------
+  // BHK
+  // -------------------------------------------------------
+
+  if (bhk != null && property.bhk != null) {
+    const requestedBhk = normalizeBhk(bhk);
+
+    const propertyBhk = normalizeBhk(property.bhk);
+
+    if (requestedBhk && propertyBhk && requestedBhk === propertyBhk) {
+      score += 10;
+    }
+  }
+
+  // -------------------------------------------------------
+  // BUDGET
+  // -------------------------------------------------------
+
   if (budgetMin != null || budgetMax != null) {
-    const buyerMin = budgetMin ?? 0;
-    const buyerMax = budgetMax ?? Number.MAX_SAFE_INTEGER;
+    const buyerMin = toNumberOrNull(budgetMin) ?? 0;
 
-    const propMin = property.budgetMin ?? 0;
-    const propMax = property.budgetMax ?? Number.MAX_SAFE_INTEGER;
+    const buyerMax = toNumberOrNull(budgetMax) ?? Number.MAX_SAFE_INTEGER;
 
-    const overlaps = propMin <= buyerMax && propMax >= buyerMin;
+    const propertyMin = toNumberOrNull(property.budgetMin) ?? 0;
+
+    const propertyMax =
+      toNumberOrNull(property.budgetMax) ?? Number.MAX_SAFE_INTEGER;
+
+    const overlaps = propertyMin <= buyerMax && propertyMax >= buyerMin;
 
     if (overlaps) {
-      score += 3;
+      score += 10;
     } else {
-      const gap = propMin > buyerMax ? propMin - buyerMax : buyerMin - propMax;
+      const gap =
+        propertyMin > buyerMax
+          ? propertyMin - buyerMax
+          : buyerMin - propertyMax;
 
-      const referencePoint = buyerMax || buyerMin || propMax || 1;
+      const referencePoint = buyerMax || buyerMin || propertyMax || 1;
 
       const gapRatio = gap / referencePoint;
 
       if (gapRatio <= 0.2) {
-        score += 1;
+        score += 2;
       } else {
-        score -= 2;
+        score -= 5;
       }
     }
   }
 
-  // ---------------------------------------------------------
-  // BHK
-  // ---------------------------------------------------------
-  if (
-    bhk &&
-    property.bhk &&
-    String(property.bhk)
-      .toLowerCase()
-      .includes(String(bhk).replace(/\D/g, "").toLowerCase())
-  ) {
-    score += 2;
+  // -------------------------------------------------------
+  // LOCATION
+  // -------------------------------------------------------
+
+  if (location && property.location) {
+    const wantedLocation = normalize(location);
+
+    const actualLocation = normalize(property.location);
+
+    if (
+      actualLocation.includes(wantedLocation) ||
+      wantedLocation.includes(actualLocation)
+    ) {
+      score += 10;
+    }
   }
 
-  // ---------------------------------------------------------
-  // Location
-  // ---------------------------------------------------------
-  if (
-    location &&
-    property.location &&
-    normalize(property.location).includes(normalize(location))
-  ) {
-    score += 2;
+  // -------------------------------------------------------
+  // CITY
+  // -------------------------------------------------------
+
+  if (property.city && query) {
+    if (containsText(query, property.city)) {
+      score += 10;
+    }
   }
 
-  // ---------------------------------------------------------
-  // Amenities
-  // ---------------------------------------------------------
+  // -------------------------------------------------------
+  // AMENITIES
+  // -------------------------------------------------------
+
   if (
     Array.isArray(amenities) &&
     amenities.length &&
@@ -299,24 +448,36 @@ function scoreMatch(
       normalize(amenity),
     );
 
-    const matched = amenities.filter((amenity) =>
-      propertyAmenities.includes(normalize(amenity)),
-    );
+    for (const amenity of amenities) {
+      const wantedAmenity = normalize(amenity);
 
-    score += matched.length;
+      if (
+        propertyAmenities.some(
+          (actualAmenity) =>
+            actualAmenity.includes(wantedAmenity) ||
+            wantedAmenity.includes(actualAmenity),
+        )
+      ) {
+        score += 5;
+      }
+    }
   }
 
   return score;
 }
 
 /**
- * Finds a project name from the CURRENT customer message
- * using actual project names present in the database.
+ * ---------------------------------------------------------
+ * FIND PROJECT MENTIONED IN CURRENT MESSAGE
+ * ---------------------------------------------------------
  *
- * This is much safer than letting the AI invent a project name.
+ * Project names are taken directly from DB.
+ * AI does not invent project names.
  */
 function findProjectMentioned(properties, query) {
-  if (!query) return null;
+  if (!query) {
+    return null;
+  }
 
   const uniqueProjects = [
     ...new Set(
@@ -324,21 +485,31 @@ function findProjectMentioned(properties, query) {
     ),
   ];
 
-  // Longest first so "The Sunflower Heights" gets checked
-  // before "The Sunflower".
+  // Longest project name first.
+  // Example:
+  // "The Sunflower Heights"
+  // before
+  // "The Sunflower"
   uniqueProjects.sort((a, b) => String(b).length - String(a).length);
 
   const found = uniqueProjects.find((project) => containsText(query, project));
 
-  return found ? { projectName: found } : null;
+  return found
+    ? {
+        projectName: found,
+      }
+    : null;
 }
 
 /**
- * Finds a city mentioned in the CURRENT customer message
- * using cities that actually exist in the property inventory.
+ * ---------------------------------------------------------
+ * FIND CITY MENTIONED IN CURRENT MESSAGE
+ * ---------------------------------------------------------
  */
 function findCityMentioned(properties, query) {
-  if (!query) return null;
+  if (!query) {
+    return null;
+  }
 
   const cities = [
     ...new Set(properties.map((property) => property.city).filter(Boolean)),
@@ -350,123 +521,286 @@ function findCityMentioned(properties, query) {
 }
 
 /**
- * Returns one representative property per project.
+ * ---------------------------------------------------------
+ * GET UNIQUE PROJECTS
+ * ---------------------------------------------------------
  *
- * Used for:
- * "Noida me kaun kaun se projects hain?"
- * "Projects kaun kaun se hain?"
+ * One representative property per project.
+ *
+ * IMPORTANT:
+ * No default limit of 5.
+ *
+ * Used when user asks for:
+ * - complete list
+ * - city-wise projects
+ * - all projects
+ * - other projects
  */
-function getUniqueProjects(properties, limit = 20) {
+function getUniqueProjects(properties) {
   const seen = new Set();
+
   const result = [];
 
   for (const property of properties) {
     const projectKey = normalize(property.projectName || "");
 
-    if (!projectKey) continue;
-    if (seen.has(projectKey)) continue;
+    // If a property does not have a project
+    // name, don't accidentally group all
+    // unnamed properties together.
+    if (!projectKey) {
+      result.push(property);
+      continue;
+    }
+
+    if (seen.has(projectKey)) {
+      continue;
+    }
 
     seen.add(projectKey);
-    result.push(property);
 
-    if (result.length >= limit) break;
+    result.push(property);
   }
 
   return result;
 }
 
 /**
- * Detect:
- * "koi aur city me"
- * "kisi aur city me"
- * "another city"
- * "other city"
- * "dusri city"
+ * ---------------------------------------------------------
+ * COMPLETE INVENTORY QUESTION
+ * ---------------------------------------------------------
+ *
+ * Examples:
+ *
+ * "tumhare paas kitni properties hain?"
+ * "aapke paas kya kya hai?"
+ * "puri list do"
+ * "complete list"
+ * "saari properties batao"
+ * "kaun kaun si properties hain?"
  */
-function isOtherCityQuestion(query) {
-  if (!query) return false;
+function isCompleteInventoryQuestion(query) {
+  if (!query) {
+    return false;
+  }
 
   return (
-    /\b(koi|kisi|kuch|another|other|different|dusri|dusre|doosri|doosre)\b.*\b(city|cities|shehar)\b/i.test(
+    // Count
+    /\bkitni\s+(property|properties)\b/i.test(query) ||
+    /\bkitne\s+(property|properties)\b/i.test(query) ||
+    // Full list
+    /\b(puri|poori|complete|full|saari|sari)\s+(list|property|properties|projects)\b/i.test(
       query,
-    ) || /\b(aur|another|other|different)\s+(city|cities|shehar)\b/i.test(query)
+    ) ||
+    // What do you have?
+    /\b(aapke paas|tumhare paas|apke paas)\b.*\b(kya|kaun|kon|kitni|kitne)\b.*\b(property|properties|project|projects)\b/i.test(
+      query,
+    ) ||
+    // Which properties?
+    /\b(kaun|kon|kaunse|konse|kaun\s+kaun|kon\s+kon)\b.*\b(property|properties|project|projects)\b/i.test(
+      query,
+    ) ||
+    // Available inventory
+    /\b(available|inventory)\b.*\b(property|properties|project|projects)\b/i.test(
+      query,
+    ) ||
+    /\b(property|properties|project|projects)\b.*\b(available|hain|hai)\b/i.test(
+      query,
+    ) ||
+    // English
+    /\bwhat\s+(properties|projects)\s+do\s+you\s+have\b/i.test(query) ||
+    /\bwhich\s+(properties|projects)\s+do\s+you\s+have\b/i.test(query)
   );
 }
 
 /**
- * Detect:
- * "The Sunflower ke alawa aur property?"
- * "aur koi property?"
- * "another project?"
+ * ---------------------------------------------------------
+ * CITY INVENTORY QUESTION
+ * ---------------------------------------------------------
+ *
+ * Examples:
+ *
+ * "Noida mein kya properties hain?"
+ * "Noida me kya kya hai?"
+ * "Kanpur ki saari properties"
+ * "Noida ke projects batao"
+ */
+function isCityInventoryQuestion(query) {
+  if (!query) {
+    return false;
+  }
+
+  const hasPropertyWord = /\b(property|properties|project|projects)\b/i.test(
+    query,
+  );
+
+  const hasListWord =
+    /\b(kaun|kon|kya|kya\s+kya|saari|sari|puri|poori|complete|all|which|what)\b/i.test(
+      query,
+    );
+
+  const hasAvailabilityWord =
+    /\b(available|hain|hai|batao|dikhao|list)\b/i.test(query);
+
+  return hasPropertyWord && (hasListWord || hasAvailabilityWord);
+}
+
+/**
+ * ---------------------------------------------------------
+ * ALL PROJECT LIST QUESTION
+ * ---------------------------------------------------------
+ */
+function isAllProjectListQuestion(query) {
+  if (!query) {
+    return false;
+  }
+
+  return (
+    /\b(aapke paas|tumhare paas|apke paas)\b.*\b(project|projects|property|properties)\b/i.test(
+      query,
+    ) && /\b(kaun|kon|kya|kitni|kitne|available|hain|hai)\b/i.test(query)
+  );
+}
+
+/**
+ * ---------------------------------------------------------
+ * OTHER CITY QUESTION
+ * ---------------------------------------------------------
+ *
+ * Examples:
+ * - "koi aur city mein hai?"
+ * - "kisi aur city mein?"
+ * - "dusri city mein property?"
+ * - "Noida ke alawa aur city?"
+ */
+function isOtherCityQuestion(query) {
+  if (!query) {
+    return false;
+  }
+
+  return (
+    /\b(koi|kisi|kuch|another|other|different|dusri|dusre|doosri|doosre|aur)\b.*\b(city|cities|shehar)\b/i.test(
+      query,
+    ) ||
+    /\b(aur|another|other|different)\s+(city|cities|shehar)\b/i.test(query) ||
+    /\b(city|cities|shehar)\b.*\b(aur|dusri|doosri|other|another)\b/i.test(
+      query,
+    )
+  );
+}
+
+/**
+ * ---------------------------------------------------------
+ * OTHER PROPERTY / OTHER PROJECT QUESTION
+ * ---------------------------------------------------------
+ *
+ * Examples:
+ * - "Sunflower ke alawa kya hai?"
+ * - "aur koi property?"
+ * - "another project?"
  */
 function isOtherPropertyQuestion(query) {
-  if (!query) return false;
+  if (!query) {
+    return false;
+  }
 
   return (
     /\b(ke alawa|ke ilawa|apart from|besides|other than)\b/i.test(query) ||
-    /\b(koi|kuch|another|other|aur)\b.*\b(property|properties|project|projects)\b/i.test(
+    /\b(koi|kuch|another|other|aur|dusra|doosra)\b.*\b(property|properties|project|projects)\b/i.test(
+      query,
+    ) ||
+    /\b(property|properties|project|projects)\b.*\b(aur|other|another)\b/i.test(
       query,
     )
   );
 }
 
 /**
- * Detect:
- * "Noida me kaun kaun se projects hain?"
- * "Noida ke projects batao"
+ * ---------------------------------------------------------
+ * SAME PROJECT
+ * ---------------------------------------------------------
  */
-function isCityProjectListQuestion(query) {
-  if (!query) return false;
-
-  return (
-    /\b(kaun|kon|konsa|konse|kaunse|which)\b.*\b(project|projects|property|properties)\b/i.test(
-      query,
-    ) ||
-    /\b(project|projects|property|properties)\b.*\b(batao|dikhao|available|hain|hai)\b/i.test(
-      query,
-    )
-  );
-}
-
-/**
- * Detect:
- * "projects kaun kaun se hain?"
- * "aapke paas kaunse projects hain?"
- */
-function isAllProjectListQuestion(query) {
-  if (!query) return false;
-
-  return (
-    /\b(aapke paas|tumhare paas|mere paas)\b.*\b(project|projects|property|properties)\b/i.test(
-      query,
-    ) ||
-    /\b(project|projects)\b.*\b(kaun|kon|available|hain|hai)\b/i.test(query)
-  );
-}
-
 function sameProject(a, b) {
-  if (!a || !b) return false;
+  if (!a || !b) {
+    return false;
+  }
 
   return normalize(a) === normalize(b);
 }
 
+/**
+ * ---------------------------------------------------------
+ * SAME CITY
+ * ---------------------------------------------------------
+ */
 function sameCity(a, b) {
-  if (!a || !b) return false;
+  if (!a || !b) {
+    return false;
+  }
 
   return normalize(a) === normalize(b);
 }
 
+/**
+ * ---------------------------------------------------------
+ * CONTAINS TEXT
+ * ---------------------------------------------------------
+ */
 function containsText(text, value) {
-  if (!text || !value) return false;
+  if (!text || !value) {
+    return false;
+  }
 
   return normalize(text).includes(normalize(value));
 }
 
+/**
+ * ---------------------------------------------------------
+ * NORMALIZE TEXT
+ * ---------------------------------------------------------
+ */
 function normalize(value) {
   return String(value || "")
     .trim()
     .toLowerCase()
     .replace(/\s+/g, " ");
+}
+
+/**
+ * ---------------------------------------------------------
+ * NORMALIZE BHK
+ * ---------------------------------------------------------
+ *
+ * Supports:
+ * - 2
+ * - 2 BHK
+ * - 2bhk
+ * - "2 BHK apartment"
+ */
+function normalizeBhk(value) {
+  const match = String(value || "").match(/\d+/);
+
+  return match ? match[0] : "";
+}
+
+/**
+ * ---------------------------------------------------------
+ * NUMBER NORMALIZER
+ * ---------------------------------------------------------
+ */
+function toNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  const cleaned = String(value).replace(/,/g, "").replace(/[₹$]/g, "").trim();
+
+  const number = Number(cleaned);
+
+  return Number.isFinite(number) ? number : null;
 }
 
 module.exports = {
