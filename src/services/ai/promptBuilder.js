@@ -1,3 +1,36 @@
+function detectRegion(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+
+  if (!digits) return "unknown";
+
+  // India
+  if (digits.startsWith("91") || digits.length === 10) {
+    return "India";
+  }
+
+  // UAE
+  if (digits.startsWith("971")) {
+    return "UAE";
+  }
+
+  // Saudi Arabia
+  if (digits.startsWith("966")) {
+    return "Saudi Arabia";
+  }
+
+  // UK
+  if (digits.startsWith("44")) {
+    return "UK";
+  }
+
+  // USA / Canada
+  if (digits.startsWith("1")) {
+    return "USA/Canada";
+  }
+
+  return "international";
+}
+
 function buildSystemInstruction({
   lead = {},
   settings = {},
@@ -1603,6 +1636,7 @@ Return the complete required JSON object.
 
 module.exports = {
   buildSystemInstruction,
+  detectRegion,
   REPLY_RESPONSE_SCHEMA,
   toGeminiHistory,
   buildOpeningHistory,
