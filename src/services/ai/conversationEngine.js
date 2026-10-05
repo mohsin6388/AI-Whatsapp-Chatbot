@@ -4,6 +4,7 @@ const Message = require("../../models/Message");
 const Meeting = require("../../models/Meeting");
 const Notification = require("../../models/Notification");
 const OutboundJob = require("../../models/OutboundJob");
+const Property = require("../../models/Property");
 
 const settingsService = require("../settings/settingsService");
 const metaWhatsappClient = require("../whatsapp/metaWhatsappClient");
@@ -26,6 +27,24 @@ const { emitToUser } = require("../../sockets");
 const logger = require("../../utils/logger");
 
 const HISTORY_LIMIT = 12; // most recent messages sent as context per turn — enough memory without blowing the token budget
+
+function isBrochureRequest(text = "") {
+  const normalized = String(text).toLowerCase().trim();
+
+  const brochureKeywords = [
+    "brochure",
+    "pdf",
+    "document",
+    "brochure bhejo",
+    "pdf bhejo",
+    "brochure send",
+    "pdf send",
+    "brochure share",
+    "pdf share",
+  ];
+
+  return brochureKeywords.some((keyword) => normalized.includes(keyword));
+}
 
 async function handleInbound({ conversation, lead, message }) {
   // Manual takeover or globally paused AI — the broker is handling this chat themselves.
@@ -201,6 +220,42 @@ async function handleInbound({ conversation, lead, message }) {
       intent: parsed.intent,
       sentiment: parsed.sentiment,
     });
+
+    if (isBrochureRequest(currentMessage) && candidateProperties.length > 0) {
+      const propertyWithBrochure = candidateProperties.find(
+        (property) => property?.brochureUrl,
+      );
+
+      if (propertyWithBrochure?.brochureUrl) {
+        try {
+          const brochureResult = await metaWhatsappClient.sendDocumentMessage({
+            phone: lead.phone,
+            documentUrl: propertyWithBrochure.brochureUrl,
+            filename:
+              propertyWithBrochure.brochureName ||
+              `${propertyWithBrochure.projectName || "property"}-brochure.pdf`,
+            caption: `${
+              propertyWithBrochure.projectName || "Property"
+            } ka brochure 📄`,
+          });
+
+          logger.info(`[ai] Brochure sent to lead ${lead._id}`, {
+            propertyId: propertyWithBrochure._id,
+            projectName: propertyWithBrochure.projectName,
+            messageId: brochureResult.messageId,
+          });
+        } catch (err) {
+          logger.error(`[ai] Failed to send brochure to lead ${lead._id}`, {
+            error: err.metaError || err.response?.data || err.message,
+          });
+        }
+      } else {
+        logger.info(`[ai] Brochure requested but no brochure available`, {
+          leadId: lead._id,
+          propertyId: candidateProperties[0]?._id,
+        });
+      }
+    }
   } catch (err) {
     logger.error(
       `[ai] Failed to send AI reply for lead ${lead._id} via Meta WhatsApp Cloud API`,

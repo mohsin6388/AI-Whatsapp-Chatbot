@@ -1,14 +1,15 @@
-const express = require('express');
+const express = require("express");
 const router = express.Router();
 
-const authenticate = require('../middlewares/auth');
-const roleGuard = require('../middlewares/roleGuard');
-const validate = require('../middlewares/validate');
-const { uploadCsv } = require('../middlewares/upload');
+const authenticate = require("../middlewares/auth");
+const roleGuard = require("../middlewares/roleGuard");
+const validate = require("../middlewares/validate");
+const { uploadCsv, uploadBrochure } = require("../middlewares/upload");
 
 const {
   previewImport,
   confirmImport,
+  uploadBrochureAndImages,
   createProperty,
   listProperties,
   getProperty,
@@ -16,7 +17,7 @@ const {
   deleteProperty,
   bulkDeleteProperties,
   exportProperties,
-} = require('../controllers/propertyController');
+} = require("../controllers/propertyController");
 
 const {
   createPropertySchema,
@@ -25,9 +26,24 @@ const {
   idParamSchema,
   bulkDeleteSchema,
   importConfirmSchema,
-} = require('../validators/propertyValidators');
+} = require("../validators/propertyValidators");
 
 router.use(authenticate);
+
+router.post(
+  "/brochure",
+  uploadBrochure.fields([
+    {
+      name: "brochure",
+      maxCount: 1,
+    },
+    {
+      name: "images",
+      maxCount: 10,
+    },
+  ]),
+  uploadBrochureAndImages,
+);
 
 // IMPORTANT: specific/static paths (import/*, export, bulk-delete) must be
 // registered BEFORE the generic "/:id" route below, otherwise Express would
@@ -35,57 +51,57 @@ router.use(authenticate);
 
 // Write access: builders and admins only.
 router.post(
-  '/import/preview',
+  "/import/preview",
   // roleGuard('builder', 'admin'),
-  uploadCsv.single('file'),
-  previewImport
+  uploadCsv.single("file"),
+  previewImport,
 );
 router.post(
-  '/import/confirm',
+  "/import/confirm",
   // roleGuard('builder', 'admin'),
   validate(importConfirmSchema),
-  confirmImport
+  confirmImport,
 );
-router.get('/export', roleGuard('builder', 'admin'), exportProperties);
+router.get("/export", roleGuard("builder", "admin"), exportProperties);
 router.post(
-  '/bulk-delete',
+  "/bulk-delete",
   // roleGuard('builder', 'admin'),
   validate(bulkDeleteSchema),
-  bulkDeleteProperties
+  bulkDeleteProperties,
 );
 router.post(
-  '/',
+  "/",
   // roleGuard('builder', 'admin'),
   validate(createPropertySchema),
-  createProperty
+  createProperty,
 );
 
 // Read access: builders (own inventory), admins (any), AND brokers (read-only,
 // active listings only) — brokers need this to browse/match properties for leads.
 router.get(
-  '/',
+  "/",
   // roleGuard('builder', 'admin', 'broker'),
   validate(listPropertiesQuerySchema),
-  listProperties
+  listProperties,
 );
 router.get(
-  '/:id',
+  "/:id",
   // roleGuard('builder', 'admin', 'broker'),
   validate(idParamSchema),
-  getProperty
+  getProperty,
 );
 
 router.patch(
-  '/:id',
+  "/:id",
   // roleGuard('builder', 'admin'),
   validate(updatePropertySchema),
-  updateProperty
+  updateProperty,
 );
 router.delete(
-  '/:id',
+  "/:id",
   // roleGuard('builder', 'admin'),
   validate(idParamSchema),
-  deleteProperty
+  deleteProperty,
 );
 
 module.exports = router;

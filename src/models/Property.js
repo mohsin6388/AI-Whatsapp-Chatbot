@@ -1,9 +1,14 @@
-const mongoose = require('mongoose');
+const mongoose = require("mongoose");
 const { Schema } = mongoose;
 
 const propertySchema = new Schema(
   {
-    ownerId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true }, // builder
+    ownerId: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    }, // builder
 
     projectName: { type: String, required: true, trim: true },
     builderName: { type: String, trim: true },
@@ -28,12 +33,63 @@ const propertySchema = new Schema(
     description: { type: String, trim: true },
     images: [{ type: String, trim: true }],
 
+    brochureUrl: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
+    brochureName: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
+    floorPlanUrl: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
+    videoUrl: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
+    dataSource: {
+      type: String,
+      enum: ["manual", "csv", "brochure"],
+      default: "manual",
+    },
+
+    brochureExtractionStatus: {
+      type: String,
+      enum: ["not_applicable", "pending", "processing", "completed", "failed"],
+      default: "not_applicable",
+    },
+
+    brochureExtractedAt: {
+      type: Date,
+      default: null,
+    },
+
     isActive: { type: Boolean, default: true },
   },
-  { timestamps: true }
+  { timestamps: true },
 );
 
-propertySchema.index({ ownerId: 1, city: 1, budgetMin: 1, budgetMax: 1, bhk: 1 });
-propertySchema.index({ projectName: 'text', description: 'text', location: 'text' });
+propertySchema.index({
+  ownerId: 1,
+  city: 1,
+  budgetMin: 1,
+  budgetMax: 1,
+  bhk: 1,
+});
+propertySchema.index({
+  projectName: "text",
+  description: "text",
+  location: "text",
+});
 
-module.exports = mongoose.model('Property', propertySchema);
+module.exports = mongoose.model("Property", propertySchema);
