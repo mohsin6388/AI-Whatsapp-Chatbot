@@ -204,6 +204,49 @@ async function sendTextMessage({ phone, text }) {
   }
 }
 
+async function sendImageMessage({ phone, imageUrl, caption }) {
+  assertConfigured();
+
+  if (!imageUrl) {
+    throw new Error("Image URL is required");
+  }
+
+  const payload = {
+    messaging_product: "whatsapp",
+    to: toWhatsAppNumber(phone),
+    type: "image",
+    image: {
+      link: imageUrl,
+      ...(caption ? { caption } : {}),
+    },
+  };
+
+  try {
+    const { data } = await http.post(`${baseUrl()}/messages`, payload, {
+      headers: headers(),
+    });
+
+    return {
+      messageId: extractMessageId(data),
+      raw: data,
+    };
+  } catch (err) {
+    const metaError = err.response?.data?.error;
+
+    const message =
+      metaError?.message || err.message || "Meta WhatsApp image send failed";
+
+    const apiError = new Error(message);
+
+    apiError.code = metaError?.code || "META_WHATSAPP_IMAGE_SEND_FAILED";
+
+    apiError.metaError = metaError || null;
+    apiError.response = err.response;
+
+    throw apiError;
+  }
+}
+
 async function sendDocumentMessage({ phone, documentUrl, filename, caption }) {
   assertConfigured();
 
@@ -457,6 +500,7 @@ module.exports = {
   sendTemplateMessage,
   sendTextMessage,
   sendDocumentMessage,
+  sendImageMessage,
   sendToLead,
   markAsRead,
   sendTypingIndicator,
