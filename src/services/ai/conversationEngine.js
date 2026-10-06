@@ -74,6 +74,54 @@ function isImageRequest(text = "") {
   return imageKeywords.some((keyword) => normalized.includes(keyword));
 }
 
+function isSiteVisitRequest(text = "") {
+  const normalized = String(text).toLowerCase().trim();
+
+  // Explicit negative requests should NOT create a visit.
+  const negativePatterns = [
+    "site visit nahi",
+    "visit nahi",
+    "site visit cancel",
+    "visit cancel",
+    "don't want to visit",
+    "do not want to visit",
+    "not interested in visit",
+  ];
+
+  if (negativePatterns.some((pattern) => normalized.includes(pattern))) {
+    return false;
+  }
+
+  const visitPatterns = [
+    "site visit book",
+    "site visit kar",
+    "site visit schedule",
+    "site visit arrange",
+    "site visit chahiye",
+    "site visit lena",
+    "site visit ke liye",
+    "site visit",
+    "visit book",
+    "visit karna hai",
+    "visit karni hai",
+    "visit schedule",
+    "visit arrange",
+    "property dekhne aana",
+    "property dekhne jaana",
+    "property dekhna hai",
+    "ghar dekhne aana",
+    "flat dekhne aana",
+    "i want to visit",
+    "want to visit",
+    "book a visit",
+    "schedule a visit",
+    "arrange a visit",
+    "book site visit",
+  ];
+
+  return visitPatterns.some((pattern) => normalized.includes(pattern));
+}
+
 async function handleInbound({ conversation, lead, message }) {
   // Manual takeover or globally paused AI — the broker is handling this chat themselves.
   if (conversation.status === "manual" || conversation.status === "closed")
@@ -325,10 +373,9 @@ async function handleInbound({ conversation, lead, message }) {
             }
           }
         } else if (wantsImages) {
-
-        /*
-         * User asked only for images
-         */
+          /*
+           * User asked only for images
+           */
           if (hasImages) {
             for (let i = 0; i < property.images.length; i++) {
               try {
@@ -401,10 +448,9 @@ async function handleInbound({ conversation, lead, message }) {
             );
           }
         } else if (wantsBrochure) {
-
-        /*
-         * User asked only for brochure
-         */
+          /*
+           * User asked only for brochure
+           */
           if (hasBrochure) {
             try {
               const brochureResult =
@@ -528,13 +574,28 @@ async function handleInbound({ conversation, lead, message }) {
   }
 
   // Buyer just agreed to a site visit — create it automatically.
-  if (parsed.wantsSiteVisit) {
+  const wantsSiteVisit =
+    parsed.wantsSiteVisit ||
+    parsed.intent === "ready_to_visit" ||
+    isSiteVisitRequest(currentMessage);
+
+  if (wantsSiteVisit) {
+    const visitProperty =
+      candidateProperties[0] ||
+      (conversation.recommendedProperties?.length
+        ? await Property.findById(
+            conversation.recommendedProperties[
+              conversation.recommendedProperties.length - 1
+            ],
+          )
+        : null);
+
     await createSiteVisit({
       lead,
       conversation,
       date: parsed.proposedDate,
       time: parsed.proposedTime,
-      property: candidateProperties[0],
+      property: visitProperty,
     });
   }
 
