@@ -150,7 +150,12 @@ async function handleInbound({ conversation, lead, message }) {
   // Pull in any properties that already look like a fit given what we know
   // so far, so the model can reference them by name instead of inventing details.
 
+  // const requirements = conversation.collectedRequirements || {};
   const requirements = conversation.collectedRequirements || {};
+
+  // Internal media-pending context ko Gemini ke customer context mein mat bhejo.
+  const aiRequirements = { ...requirements };
+  delete aiRequirements.__pendingBrochure;
 
   const currentMessage = message?.text || "";
 
@@ -173,7 +178,7 @@ async function handleInbound({ conversation, lead, message }) {
   const systemInstruction = buildSystemInstruction({
     lead,
     settings,
-    collectedRequirements: requirements,
+    collectedRequirements: aiRequirements,
     matchedProperties: candidateProperties,
     currentMessage,
 
@@ -300,22 +305,258 @@ async function handleInbound({ conversation, lead, message }) {
     const wantsBrochure = isBrochureRequest(currentMessage);
     const wantsImages = isImageRequest(currentMessage);
 
-    if ((wantsBrochure || wantsImages) && candidateProperties.length > 0) {
-      const property = candidateProperties.find(
-        (item) => item?.brochureUrl || item?.images?.length,
-      );
+    const normalizedCurrentMessage = String(currentMessage)
+      .toLowerCase()
+      .trim();
 
-      if (property) {
+    /*
+     * Positive confirmation:
+     * Example:
+     * "haan"
+     * "yes"
+     * "haan bhejo"
+     * "send it"
+     * "send"
+     */
+    const isPositiveConfirmation = [
+      "haan",
+      "ha",
+      "yes",
+      "y",
+      "ok",
+      "okay",
+      "sure",
+      "send",
+      "send it",
+      "bhejo",
+      "bhej do",
+      "share",
+      "share it",
+      "yes please",
+      "haan bhejo",
+      "haan send karo",
+      "haan share karo",
+    ].some((phrase) => {
+      return (
+        normalizedCurrentMessage === phrase ||
+        normalizedCurrentMessage.startsWith(`${phrase} `)
+      );
+    });
+
+    /*
+     * Last explicitly mentioned/recommended property.
+     */
+    let lastRecommendedProperty = null;
+
+    if (Array.isArray(conversation.recommendedProperties)) {
+      const lastPropertyId =
+        conversation.recommendedProperties[
+          conversation.recommendedProperties.length - 1
+        ];
+
+      if (lastPropertyId) {
+        try {
+          lastRecommendedProperty = await Property.findById(lastPropertyId);
+        } catch (err) {
+          logger.warn("[ai] Failed to load last recommended property", {
+            propertyId: lastPropertyId,
+            error: err.message,
+          });
+        }
+      }
+    }
+
+    /*
+     * Try to identify property from current message.
+     *
+     * Priority:
+     * 1. Gemini property_reference
+     * 2. Exact project name mentioned in message
+     * 3. Last recommended property
+     */
+    let requestedProperty = null;
+
+    /*
+     * 1. Gemini structured property reference
+     */
+    if (parsed?.property_reference) {
+      const propertyReference = String(parsed.property_reference)
+        .trim()
+        .toLowerCase();
+
+      requestedProperty =
+        candidateProperties.find(
+          (property) =>
+            property?.projectName &&
+            property.projectName.toLowerCase() === propertyReference,
+        ) || null;
+    }
+
+    /*
+     * 2. Exact project name from current message
+     */
+    if (!requestedProperty && normalizedCurrentMessage) {
+      requestedProperty =
+        candidateProperties.find((property) => {
+          if (!property?.projectName) return false;
+
+          return normalizedCurrentMessage.includes(
+            property.projectName.toLowerCase(),
+          );
+        }) || null;
+    }
+
+    /*
+     * Also check all candidate properties in case the requested
+     * property isn't inside the current top-ranked result.
+     */
+    if (!requestedProperty && normalizedCurrentMessage) {
+      try {
+        requestedProperty =
+          (await Property.findOne({
+            isActive: true,
+            projectName: {
+              $regex: normalizedCurrentMessage,
+              $options: "i",
+            },
+          })) || null;
+      } catch (err) {
+        logger.warn("[ai] Failed to find property by project name", {
+          error: err.message,
+        });
+      }
+    }
+
+    /*
+     * 3. If user didn't explicitly mention a property,
+     * use the last recommended property.
+     */
+    if (!requestedProperty && lastRecommendedProperty) {
+      requestedProperty = lastRecommendedProperty;
+    }
+
+    /*
+     * Pending brochure context.
+     *
+     * This is used when:
+     *
+     * User:
+     * "Ivory ka brochure bhejo"
+     *
+     * Ivory brochure unavailable.
+     *
+     * Assistant:
+     * "Mere paas Palm Premiere ka brochure available hai.
+     *  Chahiye?"
+     *
+     * User:
+     * "haan"
+     *
+     * Then we send Palm Premiere brochure.
+     */
+    const pendingBrochure = requirements.__pendingBrochure || null;
+
+    /*
+     * ---------------------------------------------------------
+     * HANDLE POSITIVE CONFIRMATION FOR PENDING BROCHURE
+     * ---------------------------------------------------------
+     */
+    if (isPositiveConfirmation && pendingBrochure?.propertyId) {
+      try {
+        const pendingProperty = await Property.findById(
+          pendingBrochure.propertyId,
+        );
+
+        if (pendingProperty?.brochureUrl) {
+          try {
+            const brochureResult = await metaWhatsappClient.sendDocumentMessage(
+              {
+                phone: lead.phone,
+                documentUrl: pendingProperty.brochureUrl,
+                filename:
+                  pendingProperty.brochureName ||
+                  `${pendingProperty.projectName || "property"}-brochure.pdf`,
+                caption: `${pendingProperty.projectName || "Property"} ka brochure 📄`,
+              },
+            );
+
+            logger.info(`[ai] Pending brochure sent to lead ${lead._id}`, {
+              propertyId: pendingProperty._id,
+              projectName: pendingProperty.projectName,
+              messageId: brochureResult.messageId,
+            });
+          } catch (err) {
+            logger.error(
+              `[ai] Failed to send pending brochure to lead ${lead._id}`,
+              {
+                propertyId: pendingProperty._id,
+                error: err.metaError || err.response?.data || err.message,
+              },
+            );
+          }
+        } else {
+          logger.info(`[ai] Pending brochure is no longer available`, {
+            leadId: lead._id,
+            propertyId: pendingBrochure.propertyId,
+          });
+        }
+      } catch (err) {
+        logger.error(`[ai] Failed to load pending brochure property`, {
+          leadId: lead._id,
+          propertyId: pendingBrochure.propertyId,
+          error: err.message,
+        });
+      }
+
+      /*
+       * Clear pending brochure after confirmation.
+       */
+      const updatedRequirements = {
+        ...requirements,
+      };
+
+      delete updatedRequirements.__pendingBrochure;
+
+      conversation.collectedRequirements = updatedRequirements;
+
+      await conversation.save();
+    } else if (wantsBrochure || wantsImages) {
+
+    /*
+     * ---------------------------------------------------------
+     * HANDLE EXPLICIT MEDIA REQUEST
+     * ---------------------------------------------------------
+     */
+      /*
+       * If no property could be identified,
+       * don't randomly send another property's media.
+       */
+      if (!requestedProperty) {
+        logger.info(
+          `[ai] Media requested but property could not be identified`,
+          {
+            leadId: lead._id,
+            wantsBrochure,
+            wantsImages,
+          },
+        );
+      } else {
+        const property = requestedProperty;
+
         const hasImages =
           Array.isArray(property.images) && property.images.length > 0;
 
         const hasBrochure = !!property.brochureUrl;
 
         /*
-         * User asked for BOTH images and brochure
+         * -------------------------------------------------------
+         * BOTH BROCHURE + IMAGES REQUESTED
+         * -------------------------------------------------------
          */
-        if (wantsImages && wantsBrochure) {
-          // Send images first
+        if (wantsBrochure && wantsImages) {
+          /*
+           * Send images if available.
+           */
           if (hasImages) {
             for (let i = 0; i < property.images.length; i++) {
               try {
@@ -347,7 +588,9 @@ async function handleInbound({ conversation, lead, message }) {
             }
           }
 
-          // Then send brochure
+          /*
+           * Send brochure only if it actually exists.
+           */
           if (hasBrochure) {
             try {
               const brochureResult =
@@ -371,10 +614,28 @@ async function handleInbound({ conversation, lead, message }) {
                 error: err.metaError || err.response?.data || err.message,
               });
             }
+          }
+
+          /*
+           * Nothing available.
+           */
+          if (!hasImages && !hasBrochure) {
+            logger.info(`[ai] Neither images nor brochure available`, {
+              leadId: lead._id,
+              propertyId: property._id,
+              projectName: property.projectName,
+            });
           }
         } else if (wantsImages) {
+
+        /*
+         * -------------------------------------------------------
+         * ONLY IMAGES REQUESTED
+         * -------------------------------------------------------
+         */
           /*
-           * User asked only for images
+           * IMPORTANT:
+           * No brochure fallback here.
            */
           if (hasImages) {
             for (let i = 0; i < property.images.length; i++) {
@@ -405,51 +666,22 @@ async function handleInbound({ conversation, lead, message }) {
                 );
               }
             }
-          } else if (hasBrochure) {
-            /*
-             * No images available.
-             * Use brochure as fallback.
-             */
-            try {
-              const brochureResult =
-                await metaWhatsappClient.sendDocumentMessage({
-                  phone: lead.phone,
-                  documentUrl: property.brochureUrl,
-                  filename:
-                    property.brochureName ||
-                    `${property.projectName || "property"}-brochure.pdf`,
-                  caption: `${property.projectName || "Property"} ki photos available nahi hain, isliye brochure bhej raha hoon 📄`,
-                });
-
-              logger.info(
-                `[ai] No images available, brochure sent as fallback to lead ${lead._id}`,
-                {
-                  propertyId: property._id,
-                  projectName: property.projectName,
-                  messageId: brochureResult.messageId,
-                },
-              );
-            } catch (err) {
-              logger.error(
-                `[ai] Failed to send brochure fallback to lead ${lead._id}`,
-                {
-                  propertyId: property._id,
-                  error: err.metaError || err.response?.data || err.message,
-                },
-              );
-            }
           } else {
-            logger.info(
-              `[ai] Images requested but no images or brochure available`,
-              {
-                leadId: lead._id,
-                propertyId: property._id,
-              },
-            );
+            logger.info(`[ai] Images requested but not available`, {
+              leadId: lead._id,
+              propertyId: property._id,
+              projectName: property.projectName,
+            });
           }
         } else if (wantsBrochure) {
+
+        /*
+         * -------------------------------------------------------
+         * ONLY BROCHURE REQUESTED
+         * -------------------------------------------------------
+         */
           /*
-           * User asked only for brochure
+           * Brochure exists -> send it.
            */
           if (hasBrochure) {
             try {
@@ -471,90 +703,335 @@ async function handleInbound({ conversation, lead, message }) {
             } catch (err) {
               logger.error(`[ai] Failed to send brochure to lead ${lead._id}`, {
                 propertyId: property._id,
+                projectName: property.projectName,
                 error: err.metaError || err.response?.data || err.message,
               });
             }
-          } else if (hasImages) {
-            /*
-             * No brochure available.
-             * Send available images instead.
-             */
-            for (let i = 0; i < property.images.length; i++) {
+          } else {
+
+          /*
+           * Requested property's brochure is NOT available.
+           *
+           * IMPORTANT:
+           * Do NOT send another property's brochure automatically.
+           *
+           * Instead find an alternate property with brochure
+           * and ask the user first.
+           */
+            let alternateProperty = null;
+
+            try {
+              alternateProperty =
+                (await Property.findOne({
+                  isActive: true,
+                  brochureUrl: {
+                    $exists: true,
+                    $ne: null,
+                  },
+                  _id: {
+                    $ne: property._id,
+                  },
+                })) || null;
+            } catch (err) {
+              logger.warn(`[ai] Failed to find alternate brochure property`, {
+                error: err.message,
+              });
+            }
+
+            if (alternateProperty) {
+              const mergedRequirements = {
+                ...requirements,
+              };
+
+              mergedRequirements.__pendingBrochure = {
+                propertyId: alternateProperty._id,
+                projectName: alternateProperty.projectName,
+                requestedPropertyId: property._id,
+                requestedPropertyName: property.projectName,
+                createdAt: new Date().toISOString(),
+              };
+
+              conversation.collectedRequirements = mergedRequirements;
+
+              await conversation.save();
+
+              /*
+               * Send asking message.
+               */
+              const alternateMessage =
+                `Mere paas abhi ${property.projectName || "is property"} ka brochure available nahi hai. ` +
+                `Mere paas ${alternateProperty.projectName || "ek aur property"} ka brochure available hai. ` +
+                `Kya main woh bhej doon?`;
+
               try {
-                const imageResult = await metaWhatsappClient.sendImageMessage({
-                  phone: lead.phone,
-                  imageUrl: property.images[i],
-                  caption:
-                    i === 0
-                      ? `${property.projectName || "Property"} ka brochure available nahi hai, photos bhej raha hoon 🏠`
-                      : undefined,
+                const textResult = await metaWhatsappClient.sendToLead(
+                  lead,
+                  alternateMessage,
+                );
+
+                await recordOutboundMessage({
+                  conversationId: conversation._id,
+                  leadId: lead._id,
+                  text: alternateMessage,
+                  whatsappMessageId: textResult?.messageId || null,
                 });
 
                 logger.info(
-                  `[ai] No brochure available, property image sent as fallback to lead ${lead._id}`,
+                  `[ai] Asked permission before sending alternate brochure`,
                   {
-                    propertyId: property._id,
-                    imageNumber: i + 1,
-                    messageId: imageResult.messageId,
+                    leadId: lead._id,
+                    requestedPropertyId: property._id,
+                    requestedPropertyName: property.projectName,
+                    alternatePropertyId: alternateProperty._id,
+                    alternatePropertyName: alternateProperty.projectName,
                   },
                 );
               } catch (err) {
                 logger.error(
-                  `[ai] Failed to send image fallback to lead ${lead._id}`,
+                  `[ai] Failed to ask permission for alternate brochure`,
                   {
-                    propertyId: property._id,
-                    imageNumber: i + 1,
+                    leadId: lead._id,
                     error: err.metaError || err.response?.data || err.message,
                   },
                 );
               }
+            } else {
+              logger.info(
+                `[ai] Requested brochure unavailable and no alternate brochure found`,
+                {
+                  leadId: lead._id,
+                  propertyId: property._id,
+                  projectName: property.projectName,
+                },
+              );
             }
-          } else {
-            logger.info(
-              `[ai] Brochure requested but no brochure or images available`,
-              {
-                leadId: lead._id,
-                propertyId: property._id,
-              },
-            );
           }
         }
       }
     }
 
-    // if (isBrochureRequest(currentMessage) && candidateProperties.length > 0) {
-    //   const propertyWithBrochure = candidateProperties.find(
-    //     (property) => property?.brochureUrl,
+    // const wantsBrochure = isBrochureRequest(currentMessage);
+    // const wantsImages = isImageRequest(currentMessage);
+
+    // if ((wantsBrochure || wantsImages) && candidateProperties.length > 0) {
+    //   const property = candidateProperties.find(
+    //     (item) => item?.brochureUrl || item?.images?.length,
     //   );
 
-    //   if (propertyWithBrochure?.brochureUrl) {
-    //     try {
-    //       const brochureResult = await metaWhatsappClient.sendDocumentMessage({
-    //         phone: lead.phone,
-    //         documentUrl: propertyWithBrochure.brochureUrl,
-    //         filename:
-    //           propertyWithBrochure.brochureName ||
-    //           `${propertyWithBrochure.projectName || "property"}-brochure.pdf`,
-    //         caption: `${
-    //           propertyWithBrochure.projectName || "Property"
-    //         } ka brochure 📄`,
-    //       });
+    //   if (property) {
+    //     const hasImages =
+    //       Array.isArray(property.images) && property.images.length > 0;
 
-    //       logger.info(`[ai] Brochure sent to lead ${lead._id}`, {
-    //         propertyId: propertyWithBrochure._id,
-    //         projectName: propertyWithBrochure.projectName,
-    //         messageId: brochureResult.messageId,
-    //       });
-    //     } catch (err) {
-    //       logger.error(`[ai] Failed to send brochure to lead ${lead._id}`, {
-    //         error: err.metaError || err.response?.data || err.message,
-    //       });
+    //     const hasBrochure = !!property.brochureUrl;
+
+    //     /*
+    //      * User asked for BOTH images and brochure
+    //      */
+    //     if (wantsImages && wantsBrochure) {
+    //       // Send images first
+    //       if (hasImages) {
+    //         for (let i = 0; i < property.images.length; i++) {
+    //           try {
+    //             const imageResult = await metaWhatsappClient.sendImageMessage({
+    //               phone: lead.phone,
+    //               imageUrl: property.images[i],
+    //               caption:
+    //                 i === 0
+    //                   ? `${property.projectName || "Property"} ki photos 🏠`
+    //                   : undefined,
+    //             });
+
+    //             logger.info(`[ai] Property image sent to lead ${lead._id}`, {
+    //               propertyId: property._id,
+    //               projectName: property.projectName,
+    //               imageNumber: i + 1,
+    //               messageId: imageResult.messageId,
+    //             });
+    //           } catch (err) {
+    //             logger.error(
+    //               `[ai] Failed to send property image to lead ${lead._id}`,
+    //               {
+    //                 propertyId: property._id,
+    //                 imageNumber: i + 1,
+    //                 error: err.metaError || err.response?.data || err.message,
+    //               },
+    //             );
+    //           }
+    //         }
+    //       }
+
+    //       // Then send brochure
+    //       if (hasBrochure) {
+    //         try {
+    //           const brochureResult =
+    //             await metaWhatsappClient.sendDocumentMessage({
+    //               phone: lead.phone,
+    //               documentUrl: property.brochureUrl,
+    //               filename:
+    //                 property.brochureName ||
+    //                 `${property.projectName || "property"}-brochure.pdf`,
+    //               caption: `${property.projectName || "Property"} ka brochure 📄`,
+    //             });
+
+    //           logger.info(`[ai] Brochure sent to lead ${lead._id}`, {
+    //             propertyId: property._id,
+    //             projectName: property.projectName,
+    //             messageId: brochureResult.messageId,
+    //           });
+    //         } catch (err) {
+    //           logger.error(`[ai] Failed to send brochure to lead ${lead._id}`, {
+    //             propertyId: property._id,
+    //             error: err.metaError || err.response?.data || err.message,
+    //           });
+    //         }
+    //       }
+    //     } else if (wantsImages) {
+    //       /*
+    //        * User asked only for images
+    //        */
+    //       if (hasImages) {
+    //         for (let i = 0; i < property.images.length; i++) {
+    //           try {
+    //             const imageResult = await metaWhatsappClient.sendImageMessage({
+    //               phone: lead.phone,
+    //               imageUrl: property.images[i],
+    //               caption:
+    //                 i === 0
+    //                   ? `${property.projectName || "Property"} ki photos 🏠`
+    //                   : undefined,
+    //             });
+
+    //             logger.info(`[ai] Property image sent to lead ${lead._id}`, {
+    //               propertyId: property._id,
+    //               projectName: property.projectName,
+    //               imageNumber: i + 1,
+    //               messageId: imageResult.messageId,
+    //             });
+    //           } catch (err) {
+    //             logger.error(
+    //               `[ai] Failed to send property image to lead ${lead._id}`,
+    //               {
+    //                 propertyId: property._id,
+    //                 imageNumber: i + 1,
+    //                 error: err.metaError || err.response?.data || err.message,
+    //               },
+    //             );
+    //           }
+    //         }
+    //       } else if (hasBrochure) {
+    //         /*
+    //          * No images available.
+    //          * Use brochure as fallback.
+    //          */
+    //         try {
+    //           const brochureResult =
+    //             await metaWhatsappClient.sendDocumentMessage({
+    //               phone: lead.phone,
+    //               documentUrl: property.brochureUrl,
+    //               filename:
+    //                 property.brochureName ||
+    //                 `${property.projectName || "property"}-brochure.pdf`,
+    //               caption: `${property.projectName || "Property"} ki photos available nahi hain, isliye brochure bhej raha hoon 📄`,
+    //             });
+
+    //           logger.info(
+    //             `[ai] No images available, brochure sent as fallback to lead ${lead._id}`,
+    //             {
+    //               propertyId: property._id,
+    //               projectName: property.projectName,
+    //               messageId: brochureResult.messageId,
+    //             },
+    //           );
+    //         } catch (err) {
+    //           logger.error(
+    //             `[ai] Failed to send brochure fallback to lead ${lead._id}`,
+    //             {
+    //               propertyId: property._id,
+    //               error: err.metaError || err.response?.data || err.message,
+    //             },
+    //           );
+    //         }
+    //       } else {
+    //         logger.info(
+    //           `[ai] Images requested but no images or brochure available`,
+    //           {
+    //             leadId: lead._id,
+    //             propertyId: property._id,
+    //           },
+    //         );
+    //       }
+    //     } else if (wantsBrochure) {
+    //       /*
+    //        * User asked only for brochure
+    //        */
+    //       if (hasBrochure) {
+    //         try {
+    //           const brochureResult =
+    //             await metaWhatsappClient.sendDocumentMessage({
+    //               phone: lead.phone,
+    //               documentUrl: property.brochureUrl,
+    //               filename:
+    //                 property.brochureName ||
+    //                 `${property.projectName || "property"}-brochure.pdf`,
+    //               caption: `${property.projectName || "Property"} ka brochure 📄`,
+    //             });
+
+    //           logger.info(`[ai] Brochure sent to lead ${lead._id}`, {
+    //             propertyId: property._id,
+    //             projectName: property.projectName,
+    //             messageId: brochureResult.messageId,
+    //           });
+    //         } catch (err) {
+    //           logger.error(`[ai] Failed to send brochure to lead ${lead._id}`, {
+    //             propertyId: property._id,
+    //             error: err.metaError || err.response?.data || err.message,
+    //           });
+    //         }
+    //       } else if (hasImages) {
+    //         /*
+    //          * No brochure available.
+    //          * Send available images instead.
+    //          */
+    //         for (let i = 0; i < property.images.length; i++) {
+    //           try {
+    //             const imageResult = await metaWhatsappClient.sendImageMessage({
+    //               phone: lead.phone,
+    //               imageUrl: property.images[i],
+    //               caption:
+    //                 i === 0
+    //                   ? `${property.projectName || "Property"} ka brochure available nahi hai, photos bhej raha hoon 🏠`
+    //                   : undefined,
+    //             });
+
+    //             logger.info(
+    //               `[ai] No brochure available, property image sent as fallback to lead ${lead._id}`,
+    //               {
+    //                 propertyId: property._id,
+    //                 imageNumber: i + 1,
+    //                 messageId: imageResult.messageId,
+    //               },
+    //             );
+    //           } catch (err) {
+    //             logger.error(
+    //               `[ai] Failed to send image fallback to lead ${lead._id}`,
+    //               {
+    //                 propertyId: property._id,
+    //                 imageNumber: i + 1,
+    //                 error: err.metaError || err.response?.data || err.message,
+    //               },
+    //             );
+    //           }
+    //         }
+    //       } else {
+    //         logger.info(
+    //           `[ai] Brochure requested but no brochure or images available`,
+    //           {
+    //             leadId: lead._id,
+    //             propertyId: property._id,
+    //           },
+    //         );
+    //       }
     //     }
-    //   } else {
-    //     logger.info(`[ai] Brochure requested but no brochure available`, {
-    //       leadId: lead._id,
-    //       propertyId: candidateProperties[0]?._id,
-    //     });
     //   }
     // }
   } catch (err) {
