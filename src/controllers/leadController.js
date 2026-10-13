@@ -5,7 +5,12 @@ const ApiResponse = require("../utils/ApiResponse");
 const Lead = require("../models/Lead");
 const Conversation = require("../models/Conversation");
 const AuditLog = require("../models/AuditLog");
-const { parseCsvBuffer, analyzeRows } = require("../services/csv/leadImporter");
+const {
+  parseCsvBuffer,
+  parseLeadText,
+  analyzeRows,
+} = require("../services/csv/leadImporter");
+const { importLeadRows } = require("../services/leads/leadImportService");
 const { toWhatsAppNumber } = require("../services/whatsapp/metaWhatsappClient");
 const { enqueueLeads } = require("../services/queue/outboundQueue");
 
@@ -46,6 +51,21 @@ const previewImport = asyncHandler(async (req, res) => {
 });
 
 /**
+ * POST /api/leads/import/parse-text
+ * Body: { text } — har line mein name + phone (+ email) kisi bhi order mein.
+ * Response CSV preview jaisa hi hai (valid / invalid / duplicate per row).
+ */
+const previewText = asyncHandler(async (req, res) => {
+  const rows = parseLeadText(req.body.text);
+  if (!rows.length) throw ApiError.badRequest("No leads found in the pasted text");
+
+  const { rows: analyzed, summary } = await analyzeRows(req.user.id, rows);
+  return new ApiResponse(200, { rows: analyzed, summary }, "Text parsed").send(
+    res,
+  );
+});
+
+/**
  * POST /api/leads/import/confirm
  * Client sends back the rows it wants imported (typically the "valid" subset
  * from the preview step, possibly after manual edits). Duplicate-safe via
@@ -55,54 +75,7 @@ const confirmImport = asyncHandler(async (req, res) => {
   const { rows } = req.body;
   const ownerId = req.user.id;
 
-  const docs = rows.map((r) => ({
-    ownerId,
-    name: r.name,
-    phone: toWhatsAppNumber(r.phone),
-    email: r.email || undefined,
-    city: r.city || undefined,
-    location: r.location || undefined,
-    budgetMin: r.budgetMin ?? null,
-    budgetMax: r.budgetMax ?? null,
-    occupation: r.occupation || undefined,
-    age: r.age ?? null,
-    source: r.source || "csv_import",
-    notes: r.notes || undefined,
-    requirements: r.requirements || undefined,
-  }));
-
-  let inserted = [];
-  let skipped = 0;
-
-  try {
-    inserted = await Lead.insertMany(docs, { ordered: false });
-  } catch (err) {
-    // insertMany with ordered:false throws a BulkWriteError but still inserts
-    // everything that didn't violate the unique index; err.insertedDocs holds those.
-    if (err.writeErrors) {
-      inserted = err.insertedDocs || [];
-      skipped = err.writeErrors.length;
-    } else {
-      throw err;
-    }
-  }
-
-  // Every newly-created lead gets its own empty Conversation shell so the
-  // AI/WhatsApp phase can start writing into it immediately.
-  let conversations = [];
-  if (inserted.length) {
-    try {
-      conversations = await Conversation.insertMany(
-        inserted.map((lead) => ({ leadId: lead._id, ownerId: lead.ownerId })),
-        { ordered: false },
-      );
-    } catch (err) {
-      // A conversation may already exist if this lead was re-imported — with
-      // ordered:false, everything that DIDN'T conflict still got inserted;
-      // capture those instead of silently discarding the whole batch.
-      conversations = err.insertedDocs || [];
-    }
-  }
+  const { inserted, skipped } = await importLeadRows(ownerId, rows);
 
   await AuditLog.create({
     userId: req.user.id,
@@ -496,6 +469,7 @@ const exportLeads = asyncHandler(async (req, res) => {
 
 module.exports = {
   previewImport,
+  previewText,
   confirmImport,
   startConversations,
   createLead,

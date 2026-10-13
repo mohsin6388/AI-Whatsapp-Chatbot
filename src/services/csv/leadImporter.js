@@ -109,11 +109,83 @@ function parseCsvBuffer(buffer) {
   return rows;
 }
 
+const EMAIL_RE = /[^\s@,;|<>()]+@[^\s@,;|<>()]+\.[^\s@,;|<>()]+/;
+const PHONE_RE = /\+?\d[\d\s().-]{6,}\d/;
+const MAX_TEXT_ROWS = 5000;
+
+/**
+ * "Paste karke bulk add" ke liye smart parser. Har line mein name, phone aur
+ * (optional) email kisi bhi order / separator (comma, tab, pipe, space) mein
+ * ho sakta hai:
+ *
+ *   Rahul Sharma, 9876543210, rahul@gmail.com
+ *   9876543210 | priya@x.com | Priya Singh
+ *   Amit Verma 9812345678
+ *
+ * Email regex se, phone digits-pattern se nikalte hain; jo bacha wahi naam.
+ * Output parseCsvBuffer jaisa hi shape deta hai, taaki analyzeRows() reuse ho.
+ */
+function parseLeadText(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const rows = [];
+
+  lines.forEach((rawLine, idx) => {
+    let line = rawLine.trim();
+    if (!line) return;
+    if (rows.length >= MAX_TEXT_ROWS) return;
+
+    // Header line ("Name, Phone, Email") skip
+    if (/name/i.test(line) && /(phone|mobile|number)/i.test(line) && !/\d{6,}/.test(line)) return;
+
+    // Serial number prefix "1." / "2)" hatao
+    line = line.replace(/^\d{1,4}[.)]\s+/, '');
+
+    let email = '';
+    const emailMatch = line.match(EMAIL_RE);
+    if (emailMatch) {
+      email = emailMatch[0].toLowerCase();
+      line = line.replace(emailMatch[0], ' ');
+    }
+
+    let phone = '';
+    const phoneMatch = line.match(PHONE_RE);
+    if (phoneMatch) {
+      phone = phoneMatch[0].replace(/[^\d+]/g, '');
+      line = line.replace(phoneMatch[0], ' ');
+    }
+
+    const name = line
+      .replace(/[,;|\t]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    rows.push({
+      rowNumber: idx + 1, // line number
+      name,
+      phone,
+      email,
+      city: '',
+      location: '',
+      budgetMin: null,
+      budgetMax: null,
+      occupation: '',
+      age: null,
+      source: 'bulk_paste',
+      notes: '',
+      requirements: '',
+    });
+  });
+
+  return rows;
+}
+
 /** Basic per-row validation (independent of DB state). */
 function validateRow(row) {
   const errors = [];
   if (!row.name) errors.push('Name is required');
-  if (!row.phone || row.phone.length < 7) errors.push('Valid phone number is required');
+  const phoneDigits = (row.phone || '').replace(/\D/g, '');
+  if (!row.phone || phoneDigits.length < 7) errors.push('Valid phone number is required');
+  else if (phoneDigits.length > 15) errors.push('Phone number is too long');
   if (row.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email)) errors.push('Invalid email format');
   if (row.age !== null && (Number.isNaN(row.age) || row.age < 0 || row.age > 120)) {
     errors.push('Invalid age');
@@ -167,4 +239,4 @@ async function analyzeRows(ownerId, rows) {
   return { rows: analyzed, summary };
 }
 
-module.exports = { parseCsvBuffer, validateRow, analyzeRows };
+module.exports = { parseCsvBuffer, parseLeadText, validateRow, analyzeRows };

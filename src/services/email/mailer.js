@@ -36,4 +36,81 @@ async function sendPasswordResetEmail(toEmail, resetLink) {
   await t.sendMail({ from: env.smtp.from, to: toEmail, subject, html });
 }
 
-module.exports = { sendPasswordResetEmail };
+/* ------------------------------------------------------------------ */
+/* Bulk / campaign email                                               */
+/* ------------------------------------------------------------------ */
+
+function isSmtpConfigured() {
+  return Boolean(env.smtp.host && env.smtp.user);
+}
+
+function escapeHtml(str = '') {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** {{name}}, {{firstName}}, {{phone}} placeholders ko lead ki values se bharta hai */
+function renderTemplate(text = '', vars = {}) {
+  return String(text).replace(/{{\s*(\w+)\s*}}/g, (_, key) =>
+    vars[key] !== undefined && vars[key] !== null ? String(vars[key]) : ''
+  );
+}
+
+function textToHtml(text = '') {
+  return escapeHtml(text)
+    .split(/\n{2,}/)
+    .map((p) => `<p style="margin:0 0 14px;line-height:1.55">${p.replace(/\n/g, '<br>')}</p>`)
+    .join('');
+}
+
+function fromAddressOnly() {
+  const m = String(env.smtp.from || '').match(/<([^>]+)>/);
+  return (m ? m[1] : env.smtp.from || '').trim();
+}
+
+/**
+ * Ek lead ko campaign email bhejta hai. SMTP configured nahi hai to ERROR
+ * throw karta hai (password-reset jaisa "log karke chhod do" nahi) — warna
+ * worker job ko galti se 'sent' mark kar deta.
+ */
+async function sendCampaignEmail({ to, subject, body, vars = {}, companyName = '' }) {
+  const t = getTransporter();
+  if (!t) {
+    const err = new Error('SMTP is not configured (SMTP_HOST / SMTP_USER / SMTP_PASS)');
+    err.code = 'SMTP_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const finalSubject = renderTemplate(subject, vars);
+  const finalBody = renderTemplate(body, vars);
+  const footer = companyName ? `${companyName}\n` : '';
+  const unsubscribeNote =
+    'Agar aap ye emails nahi chahte to is email ka reply karke "STOP" likh dijiye.';
+
+  const html = `
+    <div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;color:#1e293b">
+      ${textToHtml(finalBody)}
+      <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0">
+      <p style="font-size:12px;color:#64748b;line-height:1.5">${escapeHtml(footer)}${escapeHtml(unsubscribeNote)}</p>
+    </div>`;
+  const text = `${finalBody}\n\n--\n${footer}${unsubscribeNote}`;
+
+  const fromAddr = fromAddressOnly();
+  const info = await t.sendMail({
+    from: env.smtp.from,
+    to,
+    subject: finalSubject,
+    html,
+    text,
+    headers: fromAddr
+      ? { 'List-Unsubscribe': `<mailto:${fromAddr}?subject=STOP>` }
+      : undefined,
+  });
+
+  return { messageId: info.messageId };
+}
+
+module.exports = { sendPasswordResetEmail, sendCampaignEmail, renderTemplate, isSmtpConfigured };

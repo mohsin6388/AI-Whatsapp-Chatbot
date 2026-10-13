@@ -59,26 +59,31 @@ const tagsUpdateSchema = z.object({
 });
 
 // Rows coming back from the client after they reviewed the /import/preview response.
+const importRowSchema = z.object({
+  name: z.string().min(1),
+  phone: z.string().min(7),
+  email: z.string().optional().default(''),
+  city: z.string().optional().default(''),
+  location: z.string().optional().default(''),
+  budgetMin: z.number().nullable().optional(),
+  budgetMax: z.number().nullable().optional(),
+  occupation: z.string().optional().default(''),
+  age: z.number().nullable().optional(),
+  source: z.string().optional().default('csv_import'),
+  notes: z.string().optional().default(''),
+  requirements: z.string().optional().default(''),
+});
+
 const importConfirmSchema = z.object({
   body: z.object({
-    rows: z
-      .array(
-        z.object({
-          name: z.string().min(1),
-          phone: z.string().min(7),
-          email: z.string().optional().default(''),
-          city: z.string().optional().default(''),
-          location: z.string().optional().default(''),
-          budgetMin: z.number().nullable().optional(),
-          budgetMax: z.number().nullable().optional(),
-          occupation: z.string().optional().default(''),
-          age: z.number().nullable().optional(),
-          source: z.string().optional().default('csv_import'),
-          notes: z.string().optional().default(''),
-          requirements: z.string().optional().default(''),
-        })
-      )
-      .min(1, 'No rows to import'),
+    rows: z.array(importRowSchema).min(1, 'No rows to import'),
+  }),
+});
+
+// "Paste karke bulk add" — name/phone/email ki lines
+const parseTextSchema = z.object({
+  body: z.object({
+    text: z.string().min(1, 'Paste some leads first').max(500000),
   }),
 });
 
@@ -95,6 +100,8 @@ module.exports = {
   idParamSchema,
   bulkDeleteSchema,
   tagsUpdateSchema,
+  importRowSchema,
   importConfirmSchema,
+  parseTextSchema,
   startConversationsSchema,
 };

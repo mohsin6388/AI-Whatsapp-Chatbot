@@ -1288,9 +1288,15 @@ async function catchUpPendingConversations(brokerId) {
     Message.distinct("conversationId", {
       conversationId: { $in: conversationIds },
     }),
+    // failed/cancelled jobs, ya koi bhi campaign job: campaign leads ka schedule
+    // campaign khud sambhalta hai (e.g. email-only campaign ki lead ko
+    // restart par WhatsApp nahi jana chahiye).
     OutboundJob.distinct("leadId", {
       leadId: { $in: leadIds },
-      status: { $in: ["failed", "cancelled"] },
+      $or: [
+        { status: { $in: ["failed", "cancelled"] } },
+        { campaignId: { $ne: null } },
+      ],
     }),
   ]);
 

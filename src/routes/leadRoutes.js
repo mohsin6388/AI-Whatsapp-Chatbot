@@ -8,6 +8,7 @@ const { uploadCsv } = require('../middlewares/upload');
 
 const {
   previewImport,
+  previewText,
   confirmImport,
   startConversations,
   createLead,
@@ -28,6 +29,7 @@ const {
   bulkDeleteSchema,
   tagsUpdateSchema,
   importConfirmSchema,
+  parseTextSchema,
   startConversationsSchema,
 } = require('../validators/leadValidators');
 
@@ -36,6 +38,7 @@ const {
 router.use(authenticate, roleGuard('broker', 'admin'));
 
 router.post('/import/preview', uploadCsv.single('file'), previewImport);
+router.post('/import/parse-text', validate(parseTextSchema), previewText);
 router.post('/import/confirm', validate(importConfirmSchema), confirmImport);
 router.post('/start-conversations', validate(startConversationsSchema), startConversations);
 

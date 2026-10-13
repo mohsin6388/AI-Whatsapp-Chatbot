@@ -13,4 +13,5 @@ module.exports = {
   Settings: require("./Settings"),
   AuditLog: require("./AuditLog"),
   OutboundJob: require("./OutboundJob"),
+  Campaign: require("./Campaign"),
 };

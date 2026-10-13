@@ -3,6 +3,8 @@ const router = express.Router();
 
 router.use('/auth', require('./authRoutes'));
 router.use('/leads', require('./leadRoutes'));
+router.use('/campaigns', require('./campaignRoutes'));
+router.use('/outreach', require('./outreachRoutes'));
 router.use('/properties', require('./propertyRoutes'));
 router.use('/whatsapp', require('./whatsappRoutes'));
 router.use('/conversations', require('./conversationRoutes'));

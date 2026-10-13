@@ -36,7 +36,7 @@ app.use(
 // for every other route; the buffer is just discarded if unused.
 app.use(
   express.json({
-    limit: '2mb',
+    limit: '5mb', // 5000-lead bulk upload (campaign launch) ke liye
     verify: (req, res, buf) => {
       req.rawBody = buf;
     },
